@@ -1,6 +1,6 @@
 // Voice engines, NovelAI for drawing, and llm: the phone's own text model (an OpenAI-compatible API).
 import {connectionLost} from './idb.js';
-const engines=['fish','mini','eleven','mimo','doubao','custom','nai','llm','gpt','embed'];
+const engines=['fish','mini','eleven','mimo','doubao','custom','nai','llm','gpt','embed','runninghub'];
 // Keys copied from web pages and chat apps often carry invisible characters (zero-width spaces, line breaks), full-width
 // letters typed with a Chinese input method, quotes, or a "Bearer " prefix. No key contains any of these, and a service
 // answers such a key with 401 although the key itself is valid, so they are taken out before the key is kept or sent.
@@ -86,3 +86,4 @@ export class KeyStore{
  #reconnect(){return new Promise((resolve,reject)=>{const req=this.factory.open(KEY_DB);req.onsuccess=()=>{const db=req.result;if(!db.objectStoreNames.contains(KEY_STORE)){db.close();reject(Error('密钥库没有打开'));return;}this.db=db;this.#watch(db);resolve(db);};req.onerror=()=>reject(req.error);req.onblocked=()=>reject(Error('blocked'));});}
  #once(mode,work){return new Promise((resolve,reject)=>{if(!this.db){reject(Error('密钥库没有打开'));return;}let tx,result;try{tx=this.db.transaction(KEY_STORE,mode);const r=work(tx.objectStore(KEY_STORE));if(r&&'onsuccess' in r)r.onsuccess=()=>{result=r.result;};}catch(error){reject(error);return;}tx.oncomplete=()=>resolve(result);tx.onabort=tx.onerror=()=>reject(tx.error);});}
 }
+
