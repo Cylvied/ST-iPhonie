@@ -1,3 +1,4 @@
+import {isRunningHub, runningHubGenerate, retireExpandedWorkflow} from './runninghub.js';
 import {withProxyHeaders} from './proxy-url.js';
 import { normalizeNarration, NARRATOR } from './narration.js';
 import {RequestLog} from './request-log.js';
@@ -112,7 +113,7 @@ const assistantTransferRows = docs => normalizeAssistantThreads(docs.filter(row 
 })));
 const engineCheck = engine => { if (!ENGINES.includes(engine)) throw Error('引擎无效'); };
 // Keys cover the voice engines, NovelAI for drawing, and llm (the phone's own text model).
-const keyCheck = engine => { if (engine !== 'nai' && engine !== 'llm' && engine !== 'gpt' && engine !== 'embed') engineCheck(engine); };
+const keyCheck = engine => { if (engine !== 'nai' && engine !== 'llm' && engine !== 'gpt' && engine !== 'embed' && engine !== 'runninghub') engineCheck(engine); };
 const modelCheck = (engine, model) => { engineCheck(engine); if (model && !TTSParameters.catalogs[engine].models.includes(model)) throw Error('请选择列表中的模型'); };
 const message = error => error instanceof TypeError ? '设置格式无效，请检查字段和条目' : error.message;
 
@@ -212,7 +213,9 @@ export class TTSBackend {
     }
     async initialize() {
         this.assertOpen();
-        try { await this.keyStore.open?.(); for (const [engine, key] of this.keyStore.load()) { if (engine === 'nai' || engine === 'gpt') this.imageKeys[engine] = parseTextKeys(key); else if (engine === 'llm') this.textKeys = parseTextKeys(key); else if (engine === 'embed') this.embedKey = String(key).trim(); else this.providers.setKey(engine, key); } this.activateImageKeys(); }
+        const migrated = this.getState();
+        if (retireExpandedWorkflow(migrated.draw.comfy)) { applyComfyWorkflow(migrated.draw.comfy, migrated.draw.comfy.activeWorkflow); this.save(migrated); }
+        try { await this.keyStore.open?.(); for (const [engine, key] of this.keyStore.load()) { if (engine === 'nai' || engine === 'gpt') this.imageKeys[engine] = parseTextKeys(key); else if (engine === 'llm') this.textKeys = parseTextKeys(key); else if (engine === 'embed') this.embedKey = String(key).trim(); else if (engine !== 'runninghub') this.providers.setKey(engine, key); } this.activateImageKeys(); }
         catch (error) { this.notify(error.message); }
         try {
             const phone = await this.library.getPhone();
@@ -415,6 +418,7 @@ export class TTSBackend {
         try {
             if (!next || typeof next !== 'object' || !Array.isArray(next.routes) || !Array.isArray(next.presets)) throw Error('设置缺少角色或预设列表');
             copy = normalizeSettings(next);
+            if (retireExpandedWorkflow(copy.draw.comfy)) applyComfyWorkflow(copy.draw.comfy, copy.draw.comfy.activeWorkflow);
             copy.scope = this.settings.scope;
             copy.routes = copy.routes.map(route => ({ ...route, id: route.id || crypto.randomUUID(), name: String(route.name || '').trim() }));
             if (new Set(copy.routes.map(route => route.id)).size !== copy.routes.length) throw Error('角色 ID 不可重复');
@@ -624,6 +628,7 @@ export class TTSBackend {
     setKey(engine, key) {
         keyCheck(engine); if (!String(key).trim()) throw Error('请填写密钥，或使用清除密钥');
         // The text model: a stored list (from a backup) replaces every preset's key; a plain key is the active preset's.
+        if (engine === 'runninghub') { this.assertImageIdle(); this.keyStore.save(engine, key); this.emit('keys', {engine, configured:true}); return; }
         if (engine === 'llm') { if (String(key).includes('\t')) this.storeTextKeys(parseTextKeys(key)); else this.setTextKey(this.settings.text.active, key); return; }
         if (engine === 'embed') { const value = String(key).replace(/[\u200b-\u200d\ufeff]/g, '').replace(/^\s*Bearer\s+/i, '').trim(); this.keyStore.save('embed', value); this.embedKey = value; this.emit('keys', { engine, configured: true }); return; }
         if (engine === 'nai' || engine === 'gpt') {
@@ -682,6 +687,7 @@ export class TTSBackend {
     clearKey(engine) {
         keyCheck(engine);
         if (engine === 'llm') { this.clearTextKey(this.settings.text.active); return; }
+        if (engine === 'runninghub') { this.assertImageIdle(); this.keyStore.save(engine, ''); this.emit('keys', {engine, configured:false}); return; }
         if (engine === 'embed') { this.keyStore.save('embed', ''); this.embedKey = ''; this.emit('keys', { engine, configured: false }); return; }
         if (engine === 'nai' || engine === 'gpt') { this.assertImageIdle(); const map = new Map(this.imageKeys[engine]); map.delete(this.settings.draw.connections[engine].active); this.storeImageKeys(engine, map); return; }
         this.keyStore.save(engine, '');
@@ -701,10 +707,10 @@ export class TTSBackend {
         return clone(value);
     }
     /** The last 4 characters of the saved key ('' without one), so the user can tell which key is in use. */
-    keyHint(engine) { keyCheck(engine); if (engine === 'nai' || engine === 'gpt') return keyTail(this.imageKeys[engine].get(this.settings.draw.connections[engine].active)); if (engine === 'llm') return this.textKeyHint(this.settings.text.active); if (engine === 'embed') return this.embedKey ? keyTail(this.embedKey) || '••••' : ''; return keyTail(this.providers.currentKey(engine)); }
+    keyHint(engine) { keyCheck(engine); if (engine === 'runninghub') return keyTail(this.keyStore.load().get(engine) || ''); if (engine === 'nai' || engine === 'gpt') return keyTail(this.imageKeys[engine].get(this.settings.draw.connections[engine].active)); if (engine === 'llm') return this.textKeyHint(this.settings.text.active); if (engine === 'embed') return this.embedKey ? keyTail(this.embedKey) || '••••' : ''; return keyTail(this.providers.currentKey(engine)); }
     /** For a voice engine with keys: how many, which one is in use (1-based) and how many were refused while this page is open. */
     keyPool(engine) { engineCheck(engine); return this.providers.keyPool(engine); }
-    keyStatus(engine) { keyCheck(engine); return engine === 'nai' ? this.novelai.configured : engine === 'gpt' ? !!this.gptKey : engine === 'llm' ? this.textKeys.has(this.settings.text.active) : engine === 'embed' ? !!this.embedKey : this.providers.keys.has(engine); }
+    keyStatus(engine) { keyCheck(engine); if (engine === 'runninghub') return !!this.keyStore.load().get(engine); return engine === 'nai' ? this.novelai.configured : engine === 'gpt' ? !!this.gptKey : engine === 'llm' ? this.textKeys.has(this.settings.text.active) : engine === 'embed' ? !!this.embedKey : this.providers.keys.has(engine); }
 
     // ---------- 钱包 and 商城 ----------
     wallet() { return clone(this.settings.chat.wallet); }
@@ -1411,16 +1417,16 @@ export class TTSBackend {
         return { engine, params: { model: c.model, ...size, steps: c.steps, scale: c.scale, sampler: c.sampler, seed: Number.isInteger(params?.seed) && params.seed >= 0 ? params.seed : -1 }, clamped: false, free: true, guard: false, v5: false, usage: null, vibes: none, vibeAnlas: 0 };
     }
     /** Whether pictures can be drawn with the engine in use; drawMissing() says what is missing. */
-    drawReady() { const engine = this.settings.draw.engine; return engine === 'nai' ? this.novelai.configured : engine === 'gpt' ? !!this.gptKey : !!this.settings.draw.comfy.url; }
+    drawReady() { const engine = this.settings.draw.engine; return engine === 'nai' ? this.novelai.configured : engine === 'gpt' ? !!this.gptKey : isRunningHub(this.settings.draw.comfy.url) ? this.keyStatus('runninghub') : !!this.settings.draw.comfy.url; }
     /** What to ask before a picture that costs money, for the engine in use: {title, text, note}. */
     paidPrompt() { return this.settings.draw.engine === 'gpt' ? { title: 'GPT 生图要花钱', text: '每张图都按 OpenAI（或中转）的价格收费，确认后再画。', note: 'GPT 生图要花钱，点一下确认后再画' } : { title: '这张图会扣 Anlas', text: '超出了 NovelAI 的免费档，确认后再画。', note: '这张图会扣 Anlas，点一下确认后再画' }; }
-    drawMissing() { const engine = this.settings.draw.engine; return this.drawReady() ? '' : engine === 'gpt' ? '还没有填写 GPT 生图的密钥' : engine === 'comfy' ? '还没有填写 ComfyUI 地址' : '还没有填写 NovelAI 密钥'; }
+    drawMissing() { const engine = this.settings.draw.engine; return this.drawReady() ? '' : engine === 'gpt' ? '还没有填写 GPT 生图的密钥' : engine === 'comfy' ? (isRunningHub(this.settings.draw.comfy.url) ? '请在参数页导入 RunningHub 密钥' : '还没有填写 ComfyUI 地址') : '还没有填写 NovelAI 密钥'; }
     /** The GPT drawing models the saved relay (or OpenAI) offers. */
     async gptModels() { this.assertOpen(); return gptModels({ fetch: this.imageFetch, settings: this.settings.draw.gpt, key: this.gptKey }); }
     /** ComfyUI: connection check and what it offers (models, samplers, schedulers). url: an address not saved yet. */
-    async comfyCatalog(url) { this.assertOpen(); return comfyCatalog({ fetch: this.imageFetch, headers: this.tavernHeaders(), url: comfyUrl(url ?? this.settings.draw.comfy.url) }); }
-    async comfyClips({transport, signal} = {}) { this.assertOpen(); const c = this.settings.draw.comfy; return comfyClips({fetch: this.imageFetch, url: c.url, transport: transport ?? c.loraTransport, signal}); }
-    async comfyLoras({transport, signal} = {}) { this.assertOpen(); const c = this.settings.draw.comfy; return comfyLoras({fetch: this.imageFetch, url: c.url, transport: transport ?? c.loraTransport, signal}); }
+    async comfyCatalog(url) { this.assertOpen(); if (isRunningHub(url ?? this.settings.draw.comfy.url)) return {models:[], samplers:['euler'], schedulers:['simple']}; return comfyCatalog({ fetch: this.imageFetch, headers: this.tavernHeaders(), url: comfyUrl(url ?? this.settings.draw.comfy.url) }); }
+    async comfyClips({transport, signal} = {}) { this.assertOpen(); const c = this.settings.draw.comfy; if (isRunningHub(c.url)) return {clips: [], types: []}; return comfyClips({fetch: this.imageFetch, url: c.url, transport: transport ?? c.loraTransport, signal}); }
+    async comfyLoras({transport, signal} = {}) { this.assertOpen(); const c = this.settings.draw.comfy; if (isRunningHub(c.url)) return []; return comfyLoras({fetch: this.imageFetch, url: c.url, transport: transport ?? c.loraTransport, signal}); }
     async comfyWorkflows() { this.assertOpen(); return tavernWorkflows({ fetch: this.imageFetch, headers: this.tavernHeaders() }); }
     async comfyWorkflow(name) { this.assertOpen(); return tavernWorkflow({ fetch: this.imageFetch, headers: this.tavernHeaders(), name: String(name || '') }); }
     /** Draws with GPT or ComfyUI. Inputs are the NovelAI-shaped picture (scene prompt, one caption per person). */
@@ -1435,6 +1441,10 @@ export class TTSBackend {
         const text = comfyPrompt({ prompt, negative, characters });
         const graph = keepOneOutput(switchNodesOff(activeLoraWorkflow(c.workflow || defaultWorkflow(c), c.disabledLoras), c.disabledNodes || []), c.output || '');
         const workflow = fillWorkflow(graph, { ...comfyValues(c, { prompt: text.prompt, negative: text.negative, width: p.width, height: p.height, seed }), ...await this.comfyTavernValues(graph) });
+        if (isRunningHub(c.url)) {
+            const result = await runningHubGenerate({fetch: this.imageFetch, key: this.keyStore.load().get('runninghub'), workflow, signal, onTask: taskId => this.emit('draw', {runninghubTaskId: taskId})});
+            return {blob: result.blob, seed, params: {model: result.model, width: p.width, height: p.height, steps: c.steps, scale: c.scale, sampler: c.sampler, runninghubTaskId: result.taskId, runninghubCoins: result.cost}, prompt: text.prompt};
+        }
         const stopSteps = comfyProgress({ url: c.url, onStep: (value, max) => this.emit('draw', { steps: `${value}/${max} 步` }) });
         let blob;
         try { blob = await comfyGenerate({ fetch: this.imageFetch, headers: this.tavernHeaders(), url: c.url, workflow, signal }); }
@@ -1448,7 +1458,7 @@ export class TTSBackend {
             ['引擎', DRAW_ENGINE_NAMES[engine] || engine], ['模型', NAI_MODEL_NAMES[params.model] || params.model],
             ['尺寸', params.width && params.height ? `${params.width} × ${params.height}` : ''], ['步数', params.steps], ['CFG', params.scale], ['Rescale', params.cfgRescale || ''], ['采样器', params.sampler],
             ...(params.effort === 'medium' ? [['努力程度', '中']] : []), ...(params.quality && params.quality !== 'none' ? [['质量标签', qualityPresets(params.model).find(q => q.id === params.quality)?.name]] : []), ...(params.ucPreset && params.ucPreset !== 'none' ? [['负面预设', ucPresets(params.model).find(u => u.id === params.ucPreset)?.name]] : []),
-            ['种子', seed >= 0 ? seed : ''], ['画于', new Date().toLocaleString('zh-CN', { hour12: false })],
+            ['云任务', params.runninghubTaskId || ''], ['RH 币', params.runninghubCoins ?? ''], ['种子', seed >= 0 ? seed : ''], ['画于', new Date().toLocaleString('zh-CN', { hour12: false })],
             ['提示词', prompt], ['负面', negative], ['角色', (characters || []).map(c => c?.prompt).filter(Boolean).join(' | ')]
         ].filter(([, v]) => v !== undefined && v !== null && String(v).trim());
     }
@@ -3083,3 +3093,4 @@ export class TTSBackend {
     }
 }
 installDrawSettings(TTSBackend);
+
