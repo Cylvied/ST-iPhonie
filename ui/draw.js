@@ -1,3 +1,4 @@
+import {isRunningHub, runningHubRoute, RUNNINGHUB_URL} from '../core/runninghub.js';
 import {createView, esc, btn, field, input, select, textArea, toggle, heading, help, groupTitle, plate, avatar, empty, pictureCopies} from './common.js';
 import {icon} from './icons.js';
 import {saveFile, shareFile, canShareFiles} from '../download.js';
@@ -106,7 +107,7 @@ export function drawApp(ctx) {
     const e = eng();
     if (!api.drawReady()) return `<span class="chip" data-engine="none">${e === 'comfy' ? '未填地址' : '未填密钥'}</span>`;
     if (e === 'gpt') return `<span class="chip${q.free === false ? ' warn' : ''}">${icon('alert')}每张都要花钱${q.free === false ? '' : ' · 不先问'}</span>`;
-    if (e === 'comfy') return `<span class="chip">ComfyUI</span>`;
+    if (e === 'comfy') return `<span class="chip">${isRunningHub(state().comfy.url) ? 'RunningHub 云端 · 按次扣 RH 币' : 'ComfyUI'}</span>`;
     if (q.free === true) return q.v5 ? `<button type="button" class="chip as-button" data-action="usage-info">${icon(q.guard ? 'lock' : 'unlock')}V5 免费额度 ${q.usage.percent}%</button>` : `<span class="chip">${icon(q.guard ? 'lock' : 'unlock')}免费档 · 0 Anlas</span>`;
     if (q.free === false) return q.v5 && q.usage && q.params.steps <= 28 && q.params.width * q.params.height <= 1048576 ? `<button type="button" class="chip warn as-button" data-action="usage-info">${icon('alert')}V5 免费额度用完 · 会扣 Anlas</button>` : `<span class="chip warn">${icon('alert')}会扣 Anlas</span>`;
     return `<span class="chip" data-engine="none">${icon(q.guard ? 'lock' : 'unlock')}免费档内 · 订阅未确认</span>`;
@@ -149,7 +150,7 @@ export function drawApp(ctx) {
       + `<div class="token-meter" data-token-meter="positive" hidden></div><div class="actions">${btn('add-char', icon('add') + '从角色里添加', 'secondary')}${btn('add-custom', icon('add') + '手动添加', 'secondary')}</div>${free && characters.length ? `<div class="pos-tools pos-tools-all">${guideControl(d.positionGrid)}</div>` : ''}`;
     if (tab === 'params' && e === 'gpt') body = gptParams(d.gpt);
     // The lists are read as soon as the page is looked at; they can be typed in when ComfyUI does not answer.
-    if (tab === 'params' && e === 'comfy') { body = comfyParams(d.comfy, comfy); if (!comfyInfo && !comfyReading) { comfyReading = true; readComfy().finally(() => { comfyReading = false; }); } }
+    if (tab === 'params' && e === 'comfy') { body = plans.summary(comfy) + runningHubParams(d.comfy) + comfyParams(d.comfy, comfy); if (!comfyInfo && !comfyReading) { comfyReading = true; readComfy().finally(() => { comfyReading = false; }); } }
     if (tab === 'params' && e === 'nai') body = naiParams(d, size) + grid.html() + locksHTML(d) + `
       <details data-group="draw-queue"><summary>排队<small class="fold-note">间隔 ${d.queue.gap} 秒 · ${d.queue.cloud.enabled ? '云端队列开着' : '本机排队'}</small></summary><div class="fold-body">
       ${groupTitle('排队', help('一个 NovelAI 账号同一时间只能画一张。几个人共用账号时，同时请求会得到 429，太频繁还可能被风控。\n\n插件里所有出图都排成一队，一张画完再发下一张（同一个浏览器里开的几个酒馆页面也会互相等）；两张之间留出间隔；遇到 429 就等一会儿再试，等待时间一次比一次长。'))}
@@ -302,13 +303,16 @@ export function drawApp(ctx) {
       ${has('seed') ? `<div class="field"><span>种子${help('填 -1 或留空表示每次随机。种子属于本次出图，不写进方案。')}</span><div class="inline-row">${input('seed', seed >= 0 ? seed : '', 'number', 'min="-1" placeholder="随机"')}${btn('dice', icon('dice'), 'round-button', 'aria-label="随机一个种子"')}</div></div>` : ''}
     </div>`;
   }
+  function runningHubParams(c) {
+    return `<div class="group pad"><strong>RunningHub 连接</strong><p class="hint">${isRunningHub(c.url) ? '已启用云端直连，每次生成扣 RH 币。' : '可在 ComfyUI 渠道内启用云端直连，无需本地 ComfyUI。'} 请先选择已导入的原版（不扩写）方案。${api.keyStatus('runninghub') ? '密钥已保存。' : '尚未保存密钥。'}</p><label class="secondary file-button">导入密钥并启用<input type="file" data-runninghub-key accept="application/json,.json" aria-label="导入 RunningHub 密钥文件"></label></div>`;
+  }
   async function readComfy() {
     const token = ++comfyRequest, url = state().comfy.url;
     let info;
     try { info = await api.comfyCatalog(url); }
     catch (error) { info = {error: error.message, models: [], samplers: [], schedulers: []}; }
     // CLIP files and types (for a model loaded on its own): read like the LoRA list; without them they are typed.
-    if (!info.error) {
+    if (!info.error && !isRunningHub(url)) {
       try { const clip = await api.comfyClips(); info = {...info, clips: clip.clips, clipTypes: clip.types}; }
       catch (error) { info = {...info, clipError: error.message}; }
     }
@@ -367,6 +371,19 @@ export function drawApp(ctx) {
   v.back = () => { if (viewer?.open) { viewer.close(); return true; } return false; };
   v.dispose = () => { epoch++; viewer?.close(); comfyRequest++; plans.dispose(); loras.dispose(); nodes.dispose(); words.dispose(); if (previewUrl) ctx.win.URL.revokeObjectURL(previewUrl); for (const url of urls.values()) ctx.win.URL.revokeObjectURL(url); urls.clear(); dispose(); };
 
+  v.on('change', '[data-runninghub-key]', async el => {
+    const file = el.files?.[0]; el.value = ''; if (!file) return;
+    try {
+      if (file.size > 16384) throw Error('请选择 RunningHub API 密钥 JSON 文件');
+      const data = JSON.parse(await file.text()), key = data.api_key || data.apiKey;
+      if (typeof key !== 'string' || !key.trim()) throw Error('文件中没有 api_key 或 apiKey');
+      // 验证当前方案，不因导入密钥而切换到另一套工作流。
+      runningHubRoute(state().comfy.workflow);
+      await api.setKey('runninghub', key);
+      await api.saveDraw({engine: 'comfy', comfy: {url: RUNNINGHUB_URL}});
+      await render();
+    } catch (error) { ctx.notify(error.message, {error: true}); }
+  });
   v.on('input', '[data-field]', el => {
     const key = el.dataset.field;
     if (key === 'idea') { idea = el.value; grow(el); }
@@ -935,3 +952,4 @@ export function drawApp(ctx) {
   refreshSubscription();
   return v;
 }
+
