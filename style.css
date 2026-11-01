@@ -66,8 +66,8 @@
 
 /* ---------- In-text pictures (<img> tags written by the model) ----------
    The placeholder is matched by [data-sttts-pic]: the tavern prefixes classes inside messages with custom-. */
-#chat [data-sttts-pic]{--sttts-quote:var(--SmartThemeQuoteColor,currentColor);--sttts-body:var(--SmartThemeBodyColor,currentColor);display:block;width:min(100%,300px);margin:8px 0 12px}
-#chat [data-sttts-pic][data-state="done"],#chat [data-sttts-pic][data-state="generating"]{width:min(100%,560px);margin:10px 0 14px}
+#chat [data-sttts-pic]{--sttts-quote:var(--SmartThemeQuoteColor,currentColor);--sttts-body:var(--SmartThemeBodyColor,currentColor);display:block;width:min(100%,300px);margin:8px auto 12px}
+#chat [data-sttts-pic][data-state="done"],#chat [data-sttts-pic][data-state="generating"]{width:min(100%,560px);margin:10px auto 14px}
 #chat [data-sttts-pic][data-state="done"] .sttts-pic-frame{box-shadow:none;background:none}
 #chat .sttts-pic-note{position:absolute;left:8px;right:8px;bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 6px 6px 12px;border-radius:10px;font-size:.8em;color:#fff;background:rgba(10,12,24,.62);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
 #chat .sttts-pic-note button{font:inherit;color:#fff;background:rgba(255,255,255,.16);border:0;border-radius:999px;padding:3px 10px;cursor:pointer;min-height:26px}
