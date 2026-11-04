@@ -3,10 +3,12 @@
 // gets its one-click format; anything else can be told by a curl command from its docs. What cannot be read is also
 // told apart here: a service that is not running, one that lets no web page ask it, an address that means this device.
 import {CUSTOM_TEMPLATES, readVoiceList} from './custom-voice.js';
+import {reachService} from './proxy-url.js';
+export {reachService};
 
 const LOOPBACK = /^(localhost|127(\.\d+){3}|\[::1\])$/i;
 // What people paste after the address: the docs page, or the path of the speech call itself.
-const TAIL = /\/(docs|redoc|openapi\.json|tts|tts_to_audio|v1\/audio\/speech|audio\/speech|v1\/tts|v1|voice(\/\w+)?|inference_\w+|api\/tts-generate|gradio_api(\/.*)?|ui|index\.html)\/?$/i;
+const TAIL = /\/(docs\/api|api-docs|api\/docs|docs|redoc|swagger(-ui)?(\.html)?|api-reference|openapi\.json|login|tts|tts_to_audio|v1\/audio\/speech|audio\/speech|v1\/tts|v1|voice(\/\w+)?|inference_\w+|api\/tts-generate|gradio_api(\/.*)?|ui|index\.html)\/?$/i;
 
 /** An address as people type it, made one that can be asked: {base, notes} or {error}. */
 export function cleanAddress(raw) {
@@ -23,38 +25,20 @@ export function cleanAddress(raw) {
   return {base: url.origin + path, notes};
 }
 
-/**
- * Whether and how a service can be asked. direct(url, init): the browser's own request; proxy(url): through the tavern.
- * {via: 'direct' | 'proxy' | '', state: 'ok' | 'blocked' | 'mixed' | 'loopback' | 'down', proxy: 'on' | 'off' | 'none'}
- */
-export async function reachService(base, {direct, proxy, page = globalThis.location}) {
-  const target = new URL(base), loop = LOOPBACK.test(target.hostname), mixed = page?.protocol === 'https:' && target.protocol === 'http:' && !loop;
-  if (!mixed) { try { await direct(base); return {via: 'direct', state: 'ok', proxy: 'none'}; } catch { /* no answer it may read */ } }
-  // An answer that may not be read still shows the service is there.
-  let open = false;
-  if (!mixed) { try { await direct(base, {mode: 'no-cors'}); open = true; } catch { /* not there, for this device */ } }
-  let state = 'none';
-  if (proxy) {
-    try {
-      const r = await proxy(base), said = await r.clone().text().catch(() => '');
-      // (A tavern app with no proxy answers with its own page.)
-      if (/CORS proxy is disabled/i.test(said) || (r.ok && /<title>\s*SillyTavern/i.test(said))) state = 'off';
-      // The tavern's own 500: it could not reach the service either.
-      else if (r.status === 500 && /^(internal server error)?$/i.test(said.trim())) state = 'on';
-      else return {via: 'proxy', state: 'ok', proxy: 'on'};
-    } catch { state = 'off'; }
-  }
-  return {via: '', proxy: state, state: mixed ? 'mixed' : open ? 'blocked' : loop && !LOOPBACK.test(page?.hostname || 'localhost') ? 'loopback' : 'down'};
-}
+// Whether and how a service can be asked: reachService, in core/proxy-url.js (the NovelAI relay asks it too).
 
 const TURN_ON = '在酒馆文件夹的 config.yaml 里把 enableCorsProxy 改成 true，重启酒馆，再点一次。云酒馆找服务商开。';
+const NO_PROXY = '这个酒馆没有转发功能（TauriTavern 这类 App 酒馆现在没有），服务要自己允许跨域（CORS），或者套一个允许跨域的中转。';
+const LOGIN = '这个酒馆开了密码登录，带着密钥经酒馆转发会顶掉登录，所以不走酒馆：要服务自己允许跨域（CORS），或者换一个没开密码登录的酒馆。';
 /** What a failed reachService means, in plain words: {message, hint, address (a better one to try)}. */
 export function explainReach(r, base, page = globalThis.location) {
   const target = new URL(base), elsewhere = page?.hostname && !LOOPBACK.test(page.hostname) ? `${target.protocol}//${page.hostname}${target.port ? ':' + target.port : ''}` : '';
   if (r.state === 'blocked') return r.proxy === 'on'
     ? {message: '服务开着，但它不让网页直接访问，酒馆的转发也连不上它。', hint: '酒馆和服务不在同一台机器时会这样：让服务开跨域（CORS），或者把酒馆和服务放到能互相连通的地方。'}
+    : r.proxy === 'missing' ? {message: '服务开着，但它不让网页直接访问（没开跨域）。', hint: NO_PROXY}
+    : r.proxy === 'login' ? {message: '服务开着，但它不让网页直接访问（没开跨域）。', hint: LOGIN}
     : {message: '服务开着，但它不让网页直接访问（没开跨域），酒馆的转发也没开。', hint: TURN_ON};
-  if (r.state === 'mixed') return {message: '酒馆是 https 打开的，浏览器不让它连 http 地址。', hint: r.proxy === 'on' ? '酒馆的转发也连不上它：看看地址对不对、服务开着没有，或者给服务配上 https。' : TURN_ON + '或者给服务配上 https。'};
+  if (r.state === 'mixed') return {message: '酒馆是 https 打开的，浏览器不让它连 http 地址。', hint: r.proxy === 'on' ? '酒馆的转发也连不上它：看看地址对不对、服务开着没有，或者给服务配上 https。' : r.proxy === 'missing' ? '这个酒馆没有转发功能（TauriTavern 这类 App 酒馆现在没有）：给服务配上 https。' : r.proxy === 'login' ? '这个酒馆开了密码登录，带着密钥经酒馆转发会顶掉登录，所以不走酒馆：要给服务配上 https，让它自己允许跨域（CORS）。' : TURN_ON + '或者给服务配上 https。'};
   if (r.state === 'loopback') return {message: '127.0.0.1 指的是正在用的这台设备自己，这里连不到。', hint: `服务在电脑上的话，要写电脑的地址${elsewhere ? `（可能就是 ${elsewhere}）` : ''}，服务启动时要监听 0.0.0.0（GPT-SoVITS 加 -a 0.0.0.0），防火墙要放行这个端口。`, ...(elsewhere ? {address: elsewhere} : {})};
   return {message: '连不上：服务没开，或者地址、端口不对。', hint: LOOPBACK.test(target.hostname) ? '先看看服务的窗口有没有跑起来，窗口里会写端口。' : '服务开着的话，它要监听 0.0.0.0，那台电脑的防火墙要放行这个端口，两台设备要在同一个网络里。'};
 }
@@ -267,14 +251,17 @@ export function fromCurl(source) {
   if (!/^https?:\/\//i.test(url)) url = 'http://' + url;
   let target;
   try { target = new URL(url); } catch { return {error: '命令里的地址读不出来：' + url.slice(0, 60)}; }
-  // The headers: a key goes to the key store.
-  const kept = [];
+  // The headers: a key goes to the key store; one written as a stand-in ($VOICE_KEY, your-key) is asked for.
+  const kept = [], standIn = value => /^(your|xxx|\$|<)/i.test(value);
+  let wanted = false;
   for (const line of headers) {
     const m = line.match(/^\s*([\w-]+)\s*:\s*(.*)$/);
     if (!m || /^(content-type|accept|user-agent|content-length|host)$/i.test(m[1])) continue;
+    // A new id each request (Idempotency-Key: $(uuidgen)): kept as written, every line would get the first line's audio back.
+    if (/^(x-)?(idempotency-key|request-id)$/i.test(m[1])) { kept.push(`${m[1]}: {{id}}`); continue; }
     const bearer = m[2].match(/^Bearer\s+(.+)$/i);
-    if (/^authorization$/i.test(m[1]) && bearer) { if (!/\{\{/.test(bearer[1]) && !/^(your|xxx|\$)/i.test(bearer[1])) key = bearer[1].trim(); continue; }
-    if (/key|token|secret/i.test(m[1]) && !/\{\{/.test(m[2])) { if (!/^(your|xxx|\$)/i.test(m[2])) key = m[2].trim(); kept.push(`${m[1]}: {{key}}`); continue; }
+    if (/^authorization$/i.test(m[1]) && bearer) { if (!/\{\{/.test(bearer[1])) { if (standIn(bearer[1])) wanted = true; else key = bearer[1].trim(); } continue; }
+    if (/key|token|secret/i.test(m[1]) && !/\{\{/.test(m[2])) { if (standIn(m[2])) wanted = true; else key = m[2].trim(); kept.push(`${m[1]}: {{key}}`); continue; }
     kept.push(`${m[1]}: ${m[2]}`);
   }
   // The body.
@@ -309,11 +296,50 @@ export function fromCurl(source) {
   const address = target.origin + target.pathname + (flat ? '?' + flat : '');
   const notes = [];
   if (key) notes.push('命令里的密钥存好了');
+  else if (wanted) notes.push('命令里的密钥只是个占位，在上面「密钥」里粘贴自己的');
   return {params: {service: '粘贴的 curl 命令', url: address, method: method === 'GET' || (!method && !mappedBody) ? 'GET' : 'POST', body: mappedBody ? JSON.stringify(mappedBody, null, 2) : '', bodyType, headers: kept.join('\n'), answer: 'audio', path: '', before: '', pcmRate: 24000, langMap: '', listUrl: '', listPath: ''}, key, notes};
 }
 
 // ---------- telling which service it is ----------
 const template = id => CUSTOM_TEMPLATES.find(t => t.id === id);
+// Where services list their voices when they say nothing of it (OpenAI-shaped ones, FastAPI ones, a few others).
+const VOICE_LISTS = ['/v1/audio/voices', '/v1/voices', '/voices', '/api/voices', '/speakers', '/v1/speakers', '/api/speakers', '/speakers_list'];
+/** The voices a service lists, from the first of those addresses that gives some: {listUrl, count} or null. */
+export async function findVoiceList(base, ask) {
+  const answers = await Promise.all(VOICE_LISTS.map(path => ask(path).catch(() => null)));
+  for (const [i, r] of answers.entries()) {
+    if (!r?.ok) continue;
+    let json = null;
+    try { json = JSON.parse(r.text); } catch { continue; }
+    // A refusal in JSON is not a list of voices named error and detail.
+    if (!json || typeof json !== 'object' || !Array.isArray(json) && ('error' in json || 'detail' in json)) continue;
+    const count = readVoiceList(json).length;
+    if (count) return {listUrl: base + VOICE_LISTS[i], count};
+  }
+  return null;
+}
+/**
+ * Where a speech service's API may let other pages ask it although its own page does not (a 公益站 behind a sign-in
+ * page): an empty speech request (refused, nothing made or paid for) and the descriptions services publish.
+ */
+export const API_PROBES = Object.freeze([['/v1/audio/speech', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}], ['/openapi.json'], ['/gradio_api/info']]);
+/** Whether a settings' {{voice}} is a name the service knows (so a list of them helps), not a reference audio. */
+export const voiceIsName = params => /\{\{\s*voice\s*\}\}/.test([params?.url, params?.body].join('\n')) && !/\{\{\s*ref_(text|audio)/.test([params?.url, params?.body].join('\n'));
+/** Refused for want of a key: a 401 or 403 (one the tavern passed on as 400 「Unauthorized」 too), or a key named in the words. */
+function wantsKey(r) {
+  if (!r) return false;
+  if ([401, 403].includes(r.status) || /^(unauthori[sz]ed|forbidden)$/i.test(r.statusText || '')) return true;
+  let json = null;
+  try { json = JSON.parse(r.text); } catch { return false; }
+  return /api[ _-]?key|unauthori[sz]ed|not authenticated|authentication|bearer/i.test(JSON.stringify([json?.error, json?.detail, json?.message]));
+}
+/** An answer to an empty request that is OpenAI's way of refusing it: the route is there, shaped like OpenAI's. */
+function refusesLikeOpenAI(r) {
+  if (!r || ![400, 401, 403, 422].includes(r.status)) return false;
+  let json = null;
+  try { json = JSON.parse(r.text); } catch { return false; }
+  return !!json && typeof json === 'object' && (json.error !== undefined || json.detail !== undefined);
+}
 /** Paths that answer in a way only one service does, for those that publish nothing (Flask and the like). */
 const PROBES = [
   ['fish', '/v1/references/list?format=json', j => Array.isArray(j?.reference_ids)],
@@ -336,10 +362,11 @@ export async function detectService(base, ask) {
   const finish = async (found, extra = {}) => {
     const out = {...found, unknown: found.unknown || [], ...extra};
     if (out.params.listUrl) { const list = await read(out.params.listUrl); if (list?.ok && list.data) out.voices = readVoiceList(list.data, out.params.listPath).length; }
+    else if (voiceIsName(out.params)) { const list = await findVoiceList(base, ask); if (list) { out.params = {...out.params, listUrl: list.listUrl, listPath: ''}; out.voices = list.count; } }
     return out;
   };
   const known = (id, more = {}) => { const t = template(id); return finish({id, name: t.name, params: {...t.fill(base), ...more}}); };
-  const openai = async () => {
+  const openai = async (extra = {}) => {
     const [voices, others, models] = await Promise.all([read('/v1/audio/voices'), read('/v1/voices'), read('/v1/models')]);
     const list = models?.ok ? models.data?.data || models.data?.models : null, ids = Array.isArray(list) ? list.map(m => String(m?.id ?? m)) : [];
     if (ids.includes('kokoro')) return known('kokoro');
@@ -348,7 +375,7 @@ export async function detectService(base, ask) {
     if (model) params.body = params.body.replace('tts-1', model);
     if (voices?.ok && voices.data) params.listUrl = base + '/v1/audio/voices';
     else if (others?.ok && others.data) params.listUrl = base + '/v1/voices';
-    return finish({id: 'openai', name: t.name, params});
+    return finish({id: 'openai', name: t.name, params}, extra);
   };
   // A Gradio app first: new ones publish /openapi.json too, about Gradio's own routes.
   const gradio5 = (await read('/gradio_api/info'))?.data, info = gradio5?.named_endpoints ? gradio5 : (await read('/info'))?.data;
@@ -381,6 +408,15 @@ export async function detectService(base, ask) {
   const title = home?.text?.match(/<title[^>]*>([^<]*)/i)?.[1] || '';
   const named = TITLES.find(([, word]) => word.test(title));
   if (named) return known(named[0]);
+  // Nothing published, no path known: a speech route shaped like OpenAI's (公益站, relays) refuses an empty request the
+  // way OpenAI does. Nothing is made or paid for. Refused for want of a key: it says so. Asked with an id
+  // (Idempotency-Key) first: answered so, the service lets pages send one (or the tavern asks it), and every line can
+  // carry one; refused before it got there (a cross-origin check that does not allow it), asked again without.
+  const probe = more => ask('/v1/audio/speech', {method: 'POST', headers: {'Content-Type': 'application/json', ...more}, body: '{}'});
+  let empty = await probe({'Idempotency-Key': crypto.randomUUID()});
+  const ids = refusesLikeOpenAI(empty);
+  if (!ids) empty = await probe({});
+  if (refusesLikeOpenAI(empty)) return openai({...(wantsKey(empty) ? {needsKey: true} : {}), ...(ids ? {ids: true} : {})});
   return null;
 }
 

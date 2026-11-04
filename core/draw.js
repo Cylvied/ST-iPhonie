@@ -364,6 +364,13 @@ export function tidyChunkGroups(d) { [d.chunks, d.chunkGroups] = tidyGroups(d.ch
 export const styleTree = d => layerTree(d.styles, d.styleGroups);
 /** A 效果图 is the tavern's own picture files; a link to anywhere else in imported settings is not shown. */
 const COVER_PATH = /^\/?user\/images\/[^"\\?#]+$/;
+/**
+ * A picture file of the tavern, named from the tavern's root. An upload answers `/user/images/…`, on TauriTavern
+ * `user/images/…`, which the phone's frame would look for under its own folder.
+ */
+export const tavernPicture = path => typeof path === 'string' && path.startsWith('user/images/') ? '/' + path : path;
+/** A role's 角色参考图 (a small file for the 角色 App, one sent to GPT), or null when they are not pictures of the tavern. */
+export const normalizeRoleRef = ref => COVER_PATH.test(ref?.thumb) && COVER_PATH.test(ref?.full) ? {thumb: tavernPicture(String(ref.thumb)), full: tavernPicture(String(ref.full))} : null;
 /** The 画风 a picture was drawn with, by the 画师串 in its words (the longest that fits); null when none does. */
 export function styleOfWords(d, words) {
   const text = String(words || '');
@@ -444,7 +451,7 @@ export function normalizeDraw(value) {
   d.maskLook = normalizeMaskLook(d.maskLook);
   d.params = normalizeDrawParams(d.params);
   d.styles = (Array.isArray(d.styles) && d.styles.length ? d.styles : base.styles).map(s => ({id: String(s.id || crypto.randomUUID()), name: text(s.name, 60) || '画风', artist: text(s.artist, 4000), positive: text(s.positive, 4000), negative: text(s.negative, 4000),
-    ...(s.params && typeof s.params === 'object' ? {params: styleParams({...d.params, ...s.params})} : {}), ...(s.group ? {group: String(s.group)} : {}), ...(COVER_PATH.test(s.cover?.thumb) && COVER_PATH.test(s.cover?.full) ? {cover: {thumb: String(s.cover.thumb), full: String(s.cover.full)}} : {})}));
+    ...(s.params && typeof s.params === 'object' ? {params: styleParams({...d.params, ...s.params})} : {}), ...(s.group ? {group: String(s.group)} : {}), ...(COVER_PATH.test(s.cover?.thumb) && COVER_PATH.test(s.cover?.full) ? {cover: {thumb: tavernPicture(String(s.cover.thumb)), full: tavernPicture(String(s.cover.full))}} : {})}));
   tidyStyleGroups(d);
   d.activeStyle = d.styles.some(s => s.id === d.activeStyle) ? d.activeStyle : d.styles[0].id;
   // From before 画风 kept parameters: the one in use keeps the parameters in use now.
@@ -950,7 +957,7 @@ export function renderPictures(message, marker, {passive = false, pictures = {}}
     if (passive) {
       const record = pictures[tag.hash], versions = record?.versions || (record?.url ? [record] : []);
       const picture = versions[Math.min(versions.length - 1, Math.max(0, record?.index ?? versions.length - 1))];
-      out += message.slice(at, tag.start) + (picture?.url ? `<img src="${escapeHTML(picture.url)}" alt="${escapeHTML(tag.prompt)}" loading="lazy">` : '');
+      out += message.slice(at, tag.start) + (picture?.url ? `<img data-sttts-plain src="${escapeHTML(picture.url)}" alt="${escapeHTML(tag.prompt)}" loading="lazy">` : '');
       at = tag.end; continue;
     }
     out += message.slice(at, tag.start) + `<span class="sttts-pic" data-sttts-pic="${tag.index}" data-sttts-hash="${escapeHTML(tag.hash)}" data-sttts-token="${escapeHTML(marker)}"></span>`;
@@ -979,6 +986,8 @@ export function peopleCount(prompt) {
 const drawable = settings => settings.routes.filter(r => r.appearance?.trim() && !isPlaceholderRole(r.name));
 /** The role a name in a picture means: by its name, else by one of its 别名 (roles merged keep their old names that way). */
 const roleNamed = (roles, name) => roles.find(r => sameName(r.name, name)) || roles.find(r => r.aliases?.some(a => sameName(a, name)));
+/** 角色参考图 of the people in a picture, in their order (null for one with none), for GPT; nothing when nobody has one. */
+const withRefs = roles => { const refs = roles.map(r => r?.ref?.full ? {name: r.name, path: r.ref.full} : null); return refs.some(Boolean) ? {roleRefs: refs} : {}; };
 /**
  * Roles whose appearance goes into an older one-line picture tag. Names in the tag come first; when the tag names
  * nobody we know, the roles mentioned in the story just before the tag are used, up to the number of people.
@@ -1067,10 +1076,11 @@ const fixedNegative = (role, others = false) => { const tags = String(role?.nega
 /**
  * 试画一张 from the 角色 App: this look as it stands (saved or not), alone, on the 画风 in use: inputs for generateImage.
  */
-export function lookTest(settings, {appearance = '', negative = ''} = {}) {
+export function lookTest(settings, {appearance = '', negative = '', name = '', ref = null} = {}) {
   const draw = settings.draw, style = activeStyle(draw) || {}, gender = genderOf(appearance);
   const words = [style.artist, style.positive, ...(gender ? [`1${gender}, solo`] : []), 'upper body, looking at viewer, simple background'].map(x => String(x || '').trim()).filter(Boolean);
-  return {prompt: words.join(', '), negative: String(style.negative || '').trim(), characters: [{prompt: soloTags(String(appearance).trim()), negative: String(negative).trim(), position: -1}], params: {...(draw.guard ? guardParams(draw.params) : draw.params), seed: -1}};
+  return {prompt: words.join(', '), negative: String(style.negative || '').trim(), characters: [{prompt: soloTags(String(appearance).trim()), negative: String(negative).trim(), position: -1}], params: {...(draw.guard ? guardParams(draw.params) : draw.params), seed: -1},
+    ...(ref?.full ? {roleRefs: [{name: String(name || '').trim() || '角色', path: ref.full}]} : {})};
 }
 /** Character prompts count nobody: 1girl/1boy/1other in a fixed appearance become girl/boy/other. */
 const soloTags = tags => String(tags).replace(/\b1\s*(girl|boy|other)\b/gi, '$1');
@@ -1105,7 +1115,7 @@ export function pictureInputs(settings, tag, text = '') {
   if (!spec) {
     const roles = pictureRoles(settings, tag, text);
     return {prompt: [...head, tag.prompt].join(', '), negative: style.negative.trim(),
-      characters: roles.map(r => ({prompt: r.appearance.trim(), negative: fixedNegative(r, roles.length > 1), position: -1})), names: roles.map(r => r.name), params};
+      characters: roles.map(r => ({prompt: r.appearance.trim(), negative: fixedNegative(r, roles.length > 1), position: -1})), names: roles.map(r => r.name), params, ...withRefs(roles)};
   }
   const roles = drawable(settings);
   // A block with no 角色 lines still shows somebody when its scene counts people: the registered ones the reply
@@ -1113,7 +1123,7 @@ export function pictureInputs(settings, tag, text = '') {
   if (!spec.cast.length && peopleCount(spec.tags)) {
     const seen = pictureRoles(settings, {...tag, characters: [], prompt: spec.tags}, text);
     if (seen.length) return {prompt: [...head, sceneTags(spec.tags, seen.length), spec.nl].filter(Boolean).join(', '), negative: style.negative.trim(),
-      characters: seen.map(r => ({prompt: soloTags(r.appearance.trim()), negative: fixedNegative(r, seen.length > 1), position: -1})), names: seen.map(r => r.name), params};
+      characters: seen.map(r => ({prompt: soloTags(r.appearance.trim()), negative: fixedNegative(r, seen.length > 1), position: -1})), names: seen.map(r => r.name), params, ...withRefs(seen)};
   }
   const many = spec.cast.length > 1, taken = new Set();
   // Two people on one cell are drawn as one: a later one moves to the nearest free cell (below, above, right, left).
@@ -1134,5 +1144,8 @@ export function pictureInputs(settings, tag, text = '') {
     const unwanted = mergeTags((role || roleNamed(settings.routes, c.name))?.negative, c.negative);
     return {prompt: [mergeTags(soloTags(fixed), c.tags), c.nl].filter(Boolean).join(', '), negative: many ? mergeTags(withoutPeopleTags(unwanted), 'fused bodies') : unwanted, position: place(c.position)};
   });
-  return {prompt: [...head, sceneTags(spec.tags, spec.cast.length), spec.nl].filter(Boolean).join(', '), negative: style.negative.trim(), characters, names: spec.cast.map(c => c.name), params};
+  // A role with a 参考图 and no 外貌 yet is still found for it.
+  const everyone = settings.routes.filter(r => !isPlaceholderRole(r.name));
+  return {prompt: [...head, sceneTags(spec.tags, spec.cast.length), spec.nl].filter(Boolean).join(', '), negative: style.negative.trim(), characters, names: spec.cast.map(c => c.name), params,
+    ...withRefs(spec.cast.map(c => roleNamed(roles, c.name) || roleNamed(everyone, c.name)))};
 }

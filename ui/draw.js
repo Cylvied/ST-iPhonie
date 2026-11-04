@@ -1,5 +1,5 @@
 import {isRunningHub, runningHubRoute, RUNNINGHUB_URL} from '../core/runninghub.js';
-import {createView, esc, btn, field, input, select, textArea, toggle, heading, help, groupTitle, plate, avatar, empty, pictureCopies} from './common.js';
+import {createView, esc, btn, field, input, select, textArea, toggle, heading, help, groupTitle, avatar, empty, pictureCopies} from './common.js';
 import {icon} from './icons.js';
 import {saveFile, shareFile, canShareFiles} from '../download.js';
 import {openAlbum} from './album-viewer.js';
@@ -338,6 +338,7 @@ export function drawApp(ctx) {
     seed = Number.isInteger(request.seed) ? request.seed : -1;
     const routes = api.getState().routes;
     characters = (request.characters || []).map(c => ({name: routes.find(r => r.appearance?.trim() === c.prompt?.trim())?.name || '角色', prompt: c.prompt, ...(c.negative ? {negative: c.negative} : {}), position: c.position ?? -1}));
+    if (eng() === 'gpt' && request.roleRefs?.some(Boolean)) refs.useRoleRefs(request.roleRefs).catch(() => {});
     tab = 'prompt';
     render();
   };
@@ -912,7 +913,7 @@ export function drawApp(ctx) {
   }
   /** The registered people a written prompt names, added to 角色 with their looks (once). Returns who was added. */
   function addPeople(names = []) {
-    const routes = api.getState().routes, added = [];
+    const routes = api.rolesHere?.() || api.getState().routes, added = [];
     for (const name of names) {
       const r = routes.find(x => x.name === name);
       if (!r || characters.some(c => c.name === r.name)) continue;
@@ -944,7 +945,7 @@ export function drawApp(ctx) {
   }
 
   // 画风: ui/draw-styles.js.
-  const {pickStyle, editStyle} = styleSheets({ctx, state, styleId, style, render, shownPicture: () => results[current] ? shownBlob() : null, afterPaid: () => refreshSubscription(true)});
+  const {pickStyle} = styleSheets({ctx, state, styleId, style, render, shownPicture: () => results[current] ? shownBlob() : null, afterPaid: () => refreshSubscription(true)});
   watchCovers(v.root);
 
   readHearts();

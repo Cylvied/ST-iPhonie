@@ -3,7 +3,7 @@
 //
 // A chat preset holds the rules the model follows when it answers in the phone, how many recent story messages
 // and chat messages it sees, and the template used when a chat is brought into the story.
-import {promptText, promptOn} from './prompt-rules.js';
+import {promptText} from './prompt-rules.js';
 import {songOf, listeningNote} from './music.js';
 import {normalizeWallet, defaultWallet, PREMIUM, guessEmoji, yuan} from './wallet.js';
 import {parseDialogue, isPlaceholderRole} from './protocol.js';
@@ -197,10 +197,19 @@ export function normalizeStickers(list) {
  * between the name and the address. A name again replaces the old one.
  */
 export function parseStickers(text) {
-  const out = [];
-  for (const m of String(text ?? '').matchAll(/([^\s,，、;；\n]*?)\s*[:：|｜=]?\s*(https?:\/\/[^\s,，、;；"'<>]+)/gi)) {
-    const name = stickerName(m[1]);
-    if (name) out.push({name, url: m[2]});
+  // Each address, then the word right before it. (Looked for the other way round, a long paste with few addresses took seconds.)
+  const out = [], all = String(text ?? '');
+  let from = 0;
+  for (const m of all.matchAll(/https?:\/\/[^\s,，、;；"'<>]+/gi)) {
+    let end = m.index;
+    while (end > from && /\s/.test(all[end - 1])) end--;
+    if (end > from && /[:：|｜=]/.test(all[end - 1])) end--;
+    while (end > from && /\s/.test(all[end - 1])) end--;
+    let start = end;
+    while (start > from && !/[\s,，、;；]/.test(all[start - 1])) start--;
+    const name = stickerName(all.slice(start, end));
+    if (name) out.push({name, url: m[0]});
+    from = m.index + m[0].length;
   }
   return normalizeStickers(out);
 }
@@ -358,7 +367,8 @@ export function chatContacts(settings, space = null) {
   const roles = settings.routes.filter(r => !isPlaceholderRole(r.name) && here(r)).map(r => ({name: r.name, source: 'role', voice: !!r.voice, engine: r.voice ? r.engine : 'none', language: r.language || settings.general.defaultLanguage,
     // 角色资料: written in the 角色 App, else a contact of the same name's (a contact given a voice keeps who they are).
     persona: String(r.persona || settings.chat.contacts.find(c => c.name === r.name)?.persona || '').slice(0, CHAT_LIMITS.persona)}));
-  const manual = settings.chat.contacts.filter(c => !roles.some(r => r.name === c.name) && inSpace(c, space)).map(c => ({name: c.name, source: 'manual', id: c.id, voice: false, engine: 'none', language: '', persona: c.persona}));
+  // (Contacts of one name in different cards: with 分区 off everything is in one list, and a name is one person there.)
+  const manual = settings.chat.contacts.filter(c => !roles.some(r => r.name === c.name) && inSpace(c, space)).filter((c, i, all) => all.findIndex(x => x.name === c.name) === i).map(c => ({name: c.name, source: 'manual', id: c.id, voice: false, engine: 'none', language: '', persona: c.persona}));
   return [...roles, ...manual];
 }
 

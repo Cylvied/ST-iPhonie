@@ -6,6 +6,7 @@
 // a song id ({{id}}), plus where in their JSON answers the list, the id, the title, the artist and the link are (dotted
 // paths such as data.list or data.url). A lyrics address is optional.
 import {promptText} from './prompt-rules.js';
+import {normalizeSongForm, normalizeSing} from './song.js';
 
 export const BGM_MODES = Object.freeze(['off', 'tap', 'auto']);
 export const BGM_MODE_NAMES = Object.freeze({off: '关', tap: '点一下才放', auto: '自动放'});
@@ -39,7 +40,7 @@ const OLD_RULES = [[...RULE_STEPS, '最近放过：{{最近}}'].join('\n')];
 const sameRule = (a, b) => String(a).replace(/\r\n?/g, '\n').trim() === String(b).trim();
 
 export function defaultMusic() {
-  return {bgm: 'off', rule: DEFAULT_BGM_RULE, volume: 0.6, duck: true, share: true, mode: 'order', taste: true, sources: []};
+  return {bgm: 'off', rule: DEFAULT_BGM_RULE, volume: 0.6, duck: true, share: true, mode: 'order', taste: true, sources: [], writing: normalizeSongForm(), sing: normalizeSing()};
 }
 const clip = (value, max) => String(value ?? '').slice(0, max);
 const path = value => clip(value, 120).trim().replace(/[^\w.$[\]-]/g, '');
@@ -103,7 +104,8 @@ export function normalizeMusic(value) {
     volume: Number.isFinite(Number(value.volume)) ? Math.min(1, Math.max(0, Number(value.volume))) : base.volume,
     duck: value.duck !== false, share: value.share !== false,
     mode: PLAY_MODES.includes(value.mode) ? value.mode : base.mode, taste: value.taste !== false,
-    sources: sources.map(s => seen.has(s.id) ? {...s, id: s.id + '-' + seen.size} : s).filter(s => seen.add(s.id))
+    sources: sources.map(s => seen.has(s.id) ? {...s, id: s.id + '-' + seen.size} : s).filter(s => seen.add(s.id)),
+    writing: normalizeSongForm(value.writing), sing: normalizeSing(value.sing)
   };
 }
 
@@ -322,7 +324,8 @@ export function bestMatch(songs, want) {
   for (const s of songs) { const n = matchScore(s, want); if (n > score) { best = s; score = n; } }
   return best;
 }
-/** A song row as kept in the library: {id, kind: 'song', at, title, artist, origin: 'file'|'source', size?, mime?, source?, songId?, lyric?}. */
+/** A song row as kept in the library: {id, kind: 'song', at, title, artist, origin: 'file'|'source', size?, mime?, file?, source?, songId?, lyric?}
+ *  (file: the name of the file it was added from, since 0.9.22). */
 export function songRow(value = {}, at = Date.now()) {
   const title = clip(value.title, 200).trim();
   if (!title) throw Error('给这首歌起个名字');
@@ -331,9 +334,30 @@ export function songRow(value = {}, at = Date.now()) {
   if (value.lyric) row.lyric = clip(value.lyric, 60000);
   return row;
 }
-/** A file name as 歌名 and 歌手 (「歌手 - 歌名.mp3」 is the usual way music files are named). */
+/** A file name as 歌名 and 歌手 (「歌手 - 歌名.mp3」 is the usual way music files are named; a track number in front,
+ *  「01. 歌名」「01 - 歌名」「1-01 歌名」「01 歌名」, is left out — with a 0 first only, so 「7 Rings」 stays). */
 export function titleFromFile(name) {
-  const base = String(name ?? '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/_/g, ' ').trim();
+  const whole = String(name ?? '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/_/g, ' ').trim();
+  const base = whole.replace(/^(?:\d{1,2}-)?(?:\d{1,3}\s*[.、．)]\s*|\d{1,3}\s+-\s+|0\d{1,2}\s+)(?=\S)/, '') || whole;
   const parts = base.split(/\s+-\s+/);
   return parts.length >= 2 ? {title: parts.slice(1).join(' - ').trim(), artist: parts[0].trim()} : {title: base, artist: ''};
+}
+/** Whether a picked file is a song the 歌单 has already: the same size and the same file name (a song kept before file
+ *  names were: the same title, as the tags or the file name give it). */
+export function sameFile(row, have) {
+  if (!have || have.origin === 'source' || !row?.size || row.size !== have.size) return false;
+  if (row.file && have.file) return row.file === have.file;
+  const t = loose(have.title);
+  return !!t && (t === loose(row.title) || (!!row.file && t === loose(titleFromFile(row.file).title)));
+}
+/** The 本机的歌 an .lrc file is for: the one whose file has the same name, else the one its name says (歌手 - 歌名;
+ *  only a 歌名 when one song alone has it). null when none is. */
+export function lyricOwner(name, songs) {
+  const stem = s => loose(String(s ?? '').replace(/\.[a-z0-9]{2,5}$/i, ''));
+  const own = songs.find(s => s.file && stem(s.file) === stem(name));
+  if (own) return own;
+  const want = titleFromFile(name), named = songs.find(s => songKey(s) === songKey(want));
+  if (named || want.artist) return named || null;
+  const titled = songs.filter(s => loose(s.title) === loose(want.title));
+  return titled.length === 1 ? titled[0] : null;
 }

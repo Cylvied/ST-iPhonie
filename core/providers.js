@@ -1,10 +1,10 @@
 import {buildDoubaoRequest,doubaoAudio,DOUBAO_VOICES} from './doubao.js';
-import {proxyAddress} from './proxy-url.js';
-import { validateKey, MULTI_KEY, keyTail } from './keys.js';
+import {proxyAddress, noTavernProxy, tavernLogin} from './proxy-url.js';
+import { validateKey, MULTI_KEY, keyTail, parseTextKeys } from './keys.js';
 import { languageCode } from './languages.js';
-import { TTSParameters as P, FISH_PROXY_NOTE, FISH_NATIVE_REFS, FISH_API, FISH_TAURI_NOTE, FISH_PROXY_PAGE, DOUBAO_PROXY_NOTE, DOUBAO_DIRECT_NOTE, DOUBAO_RELAY_NOTE, DOUBAO_PROXY_PAGE, tauriTavern, setFishCompat } from './parameters.js';
+import { TTSParameters as P, CUSTOM_NO_PROXY, FISH_PROXY_NOTE, FISH_NATIVE_REFS, FISH_API, FISH_TAURI_NOTE, FISH_PROXY_PAGE, DOUBAO_PROXY_NOTE, DOUBAO_DIRECT_NOTE, DOUBAO_RELAY_NOTE, DOUBAO_PROXY_PAGE, tauriTavern, setFishCompat } from './parameters.js';
 import { speakable } from './voice-fx.js';
-import { buildCustomRequest, customInit, readCustomAnswer, customVoices, readVoiceList, gradioRoot, referenceFile, serviceSaid } from './custom-voice.js';
+import { buildCustomRequest, customInit, readCustomAnswer, customVoices, readVoiceList, gradioRoot, referenceFile, serviceSaid, usesId, customSetOf, customParams, CUSTOM_DEFAULT } from './custom-voice.js';
 import { unpacked, audioKind } from './audio-bytes.js';
 const names={fish:'Fish Audio',mini:'MiniMax',eleven:'ElevenLabs',mimo:'小米 MiMo',doubao:'豆包语音',custom:'自己的接口'};
 export const miniBase=c=>'https://'+(c.region==='cn'?'api.minimaxi.com':c.region==='uw'?'api-uw.minimax.io':'api.minimax.io');
@@ -37,7 +37,9 @@ function checkedConnection(engine,connection,route,line,references){
 }
 export function buildRequest(engine,connection,route,line,references=new Map()){line=speakable(line);// 心声/电话 are played, not read: off the emotion before the engine sees it.
  // 自己的接口: the user's templates (core/custom-voice.js).
- if(engine==='custom'){if(!object(connection)||!object(connection.params))throw Error('引擎设置格式无效，请重新保存引擎设置');return buildCustomRequest({...connection,params:{...P.defaults('custom'),...connection.params}},route,line);}
+ // One of several sets: the role's own, else the one in use. A set other than the first says which (its key is its own),
+ // so a request of the first set is what it always was and its saved audio is still found.
+ if(engine==='custom'){if(!object(connection)||!object(connection.params))throw Error('引擎设置格式无效，请重新保存引擎设置');const set=customSetOf(connection,route?.model),request=buildCustomRequest({...connection,params:{...P.defaults('custom'),...customParams(connection,set)}},route,line);return set===CUSTOM_DEFAULT?request:{...request,config:set};}
  const c=checkedConnection(engine,connection,route,line,references);
  if(engine==='doubao'){P.normalize(engine,c);const error=P.validate(engine,c);if(error)throw Error(error);return buildDoubaoRequest(c,route,line);}
  // MiMo's preset model knows only its own voices. A 音色 that names a clone sample is drawn with the clone model;
@@ -141,15 +143,28 @@ export async function httpError(engine,response,what='',secrets=[],relay=false){
  return Object.assign(Error(names[engine]+(what?' '+what:'')+'：HTTP '+response.status+' · '+reason+(said?'（'+said+'）':'')),{status:response.status,code,refusedField:refused?.[1]||''});
 }
 const KEY_SWITCH=new Set([401,402,403,429]);
+const KEY_BEHIND_LOGIN='这个酒馆开了密码登录：带密钥的请求经酒馆转发会顶掉登录（浏览器会一直要密码），所以没有转发。这个服务要自己允许网页直接访问（跨域 CORS），或者换一个没开密码登录的酒馆';
+const originOf=target=>{try{return new URL(target,globalThis.location?.href).origin;}catch{return '';}};
+/** A pause that ends early, as stopped, when the signal says so. */
+const pause=(ms,signal)=>new Promise((resolve,reject)=>{if(signal?.aborted){reject(new DOMException('已停止','AbortError'));return;}const t=setTimeout(()=>{signal?.removeEventListener('abort',stop);resolve();},ms),stop=()=>{clearTimeout(t);reject(new DOMException('已停止','AbortError'));};signal?.addEventListener('abort',stop,{once:true});});
 export class Providers{
  // refused: fields a model said it does not take (model -> Set), left out of later requests while the page is open.
- constructor(fetcher=globalThis.fetch.bind(globalThis)){this.fetcher=fetcher;this.keys=new Map();this.references=new Map();this.refused=new Map();this.pools=new Map();}
- setKey(engine,key){key=validateKey(engine,key);if(key)this.keys.set(engine,key);else{this.keys.delete(engine);this.pools.delete(engine);}}
+ constructor(fetcher=globalThis.fetch.bind(globalThis)){this.fetcher=fetcher;this.keys=new Map();this.references=new Map();this.refused=new Map();this.pools=new Map();
+  // 自己的接口: the {{id}} of lines that got no answer (sent again with it), the services only the tavern's proxy reaches.
+  this.unsettled=new Map();this.customVia=new Set();this.page=globalThis.location;
+  // 自己的接口's keys, one per set (the backend keeps them).
+  this.customKeys=new Map();}
+ setKey(engine,key){key=validateKey(engine,key);
+  // 自己的接口: one key a set (lines of "<set id><tab><key>"); a plain key is the first set's, as one saved before sets.
+  if(engine==='custom'){this.customKeys=key.includes('	')?parseTextKeys(key):key?new Map([[CUSTOM_DEFAULT,key]]):new Map();return;}
+  if(key)this.keys.set(engine,key);else{this.keys.delete(engine);this.pools.delete(engine);}}
  // Several keys (one per line): the one in use and those refused while this page is open, remembered by the keys
  // themselves, so adding or deleting a key keeps both.
  pool(engine){const keys=(this.keys.get(engine)||'').split('\n').filter(Boolean);let p=this.pools.get(engine);if(!p){p={current:'',refused:new Set()};this.pools.set(engine,p);}
   for(const key of p.refused)if(!keys.includes(key))p.refused.delete(key);if(!keys.includes(p.current))p.current=keys.find(key=>!p.refused.has(key))||keys[0]||'';return {keys,p};}
  currentKey(engine){return this.pool(engine).p.current;}
+ /** 自己的接口: a set's key ('' without one). */
+ customKey(set=CUSTOM_DEFAULT){return this.customKeys.get(set||CUSTOM_DEFAULT)||'';}
  /** {count, current (1-based), refused} for an engine with keys, else null. */
  keyPool(engine){const {keys,p}=this.pool(engine);return keys.length?{count:keys.length,current:keys.indexOf(p.current)+1,refused:p.refused.size}:null;}
  /** Each saved key as the UI may show it: its last characters, whether it is in use, whether it was refused this time. */
@@ -193,7 +208,8 @@ export class Providers{
   if(request.engine==='mini')return decodeMini(response,request,this.fetcher,signal);if(response.headers.get('Content-Type')?.includes('json'))throw Error(names[request.engine]+' 未返回音频');const bytes=await limitedBytes(response);return audioBlob(await unpacked(bytes)||bytes,request);}
  /**
   * 自己的接口: the request as the templates say, the key (optional) put in now. A service that does not let web pages
-  * ask it (no CORS) is asked again through the tavern's own proxy (this.proxy, set by the backend).
+  * ask it (no CORS) is asked again through the tavern's own proxy (this.proxy, set by the backend), and there at once
+  * from then on.
   */
  async speakCustom(request,signal){
   // One at a time: a model is switched for this line and must not be switched again by another before it is said.
@@ -201,28 +217,56 @@ export class Providers{
   this.customTurn=turn;return turn;
  }
  async speakCustomNow(request,signal){
-  const key=this.currentKey('custom'),audio=request.refFile?this.references.get(request.refFile):'';
+  const key=this.customKey(request.config),audio=request.refFile?this.references.get(request.refFile):'';
   if(request.refFile&&!audio)throw Error('参考音频读不出来了：在引擎 App「自己的接口」的音色里重新上传一段');
   const uploaded=audio&&request.answer==='gradio'?await this.gradioUpload(request,audio,signal):'';
-  const {url,init}=customInit(request,key,{audio,uploaded});
+  // {{id}}: a line that got no answer last time goes again with the same one, so a service that keeps them
+  // (Idempotency-Key) answers with what it made instead of making and charging it twice. An answered line gets a new one.
+  const which=JSON.stringify([request.url,request.headers,request.body??null]),id=this.unsettled.get(which)||crypto.randomUUID();
+  const {url,init}=customInit(request,key,{audio,uploaded,id});
   // Links and later steps are read with the same headers, less the head of a body they do not have.
   const asked=Object.fromEntries(Object.entries(init.headers).filter(([h])=>h.toLowerCase()!=='content-type'));
-  const send=async(target,how=init)=>{try{return await fetchWithPolicy(this.fetcher,target,how,signal);}catch(error){if(signal?.aborted||!this.proxy||!/无法连接/.test(error.message))throw error;
+  // What came through the tavern's proxy, asked by the plugin or written in the address: a tavern with none answers with its own page.
+  const passed=async r=>{const said=await r.clone().text().catch(()=>'');if(/CORS proxy is disabled/i.test(said))throw Error('自己的接口不让网页直接访问：在酒馆的 config.yaml 里把 enableCorsProxy 改成 true 再重启酒馆');if(noTavernProxy(said))throw Error(CUSTOM_NO_PROXY);return r;};
+  const tavern=async(target,how)=>{
    // The tavern's proxy passes JSON on and nothing else.
    if(how.body&&typeof how.body!=='string')throw Error('连不上自己的接口。这种接口收表单或文件，酒馆的转发传不了：服务开着吗？地址和端口对吗？它要自己允许跨域');
-   const relayed=await this.proxy(target,how,signal).catch(()=>null);if(!relayed)throw Error('连不上自己的接口：地址不对、服务没开，或者它不让网页直接访问（可以在酒馆的 config.yaml 里把 enableCorsProxy 改成 true 再重启酒馆）');
-   if(/CORS proxy is disabled/i.test(await relayed.clone().text().catch(()=>'')))throw Error('自己的接口不让网页直接访问：在酒馆的 config.yaml 里把 enableCorsProxy 改成 true 再重启酒馆');return relayed;}};
+   const relayed=await this.tavern(target,how,signal).catch(error=>{if(error?.login||signal?.aborted)throw error;return null;});if(!relayed)throw Error('连不上自己的接口：地址不对、服务没开，或者它不让网页直接访问（可以在酒馆的 config.yaml 里把 enableCorsProxy 改成 true 再重启酒馆）');
+   return passed(relayed);};
+  // A service only the tavern's proxy reaches is asked there at once from then on (while the page is open).
+  const send=async(target,how=init)=>{const at=originOf(target);if(this.proxy&&at&&this.customVia.has(at))return tavern(target,how);
+   let r;try{r=await fetchWithPolicy(this.fetcher,target,how,signal);}catch(error){if(signal?.aborted||!this.proxy||!/无法连接/.test(error.message))throw error;const relayed=await tavern(target,how);if(at)this.customVia.add(at);return relayed;}
+   return proxyAddress(target)?passed(r):r;};
   // 换模型: only when this voice's model is not the one loaded last.
   const loaded=(request.before||[]).join('\n');
   if(loaded&&this.customLoaded!==loaded){this.customLoaded='';for(const step of request.before){const {url:target,init:get}=customInit({...request,url:step,method:'GET',body:undefined});const r=await send(target,get).catch(e=>{throw Error('换模型失败：'+e.message);});
    if(!r.ok){const said=(await r.text().catch(()=>'')).replace(/\s+/g,' ').slice(0,160);throw Error('换模型失败（HTTP '+r.status+'）'+(said?'：'+said:'')+'：检查音色里模型的路径');}await r.body?.cancel?.().catch(()=>{});}this.customLoaded=loaded;}
-  const response=await send(url);
-  return readCustomAnswer(response,request,{read:limitedBytes,load:link=>send(link,{method:'GET',headers:asked}),wave:wavePCM}).catch(error=>{if(request.answer==='gradio')this.gradioFiles?.clear();throw error;});
+  let answered=false;
+  try{
+   let response=await send(url);
+   // Given up on by the service while it was still being made (504): with an id it is asked again after a pause, and a
+   // service that keeps ids answers with what it made.
+   for(const wait of this.retryWaits||[5000,10000,20000,40000]){if(response.status!==504||!usesId(request))break;await response.body?.cancel?.().catch(()=>{});await pause(wait,signal);response=await send(url);}
+   if(response.status===504&&usesId(request)){await response.body?.cancel?.().catch(()=>{});throw Error('自己的接口那边排队太久：等了好几分钟还没做好，这句先跳过。过一会儿再播，会用同一个编号去要，不用重做');}
+   answered=true;
+   const blob=await readCustomAnswer(response,request,{read:limitedBytes,load:link=>send(link,{method:'GET',headers:asked}),wave:wavePCM});
+   this.unsettled.delete(which);return blob;
+  }catch(error){
+   if(request.answer==='gradio')this.gradioFiles?.clear();
+   // No answer, or not the end of one (cut off, stopped, still being made): the same id next time.
+   this.unsettled.delete(which);if(!answered){this.unsettled.set(which,id);if(this.unsettled.size>100)this.unsettled.delete(this.unsettled.keys().next().value);}
+   throw error;
+  }
  }
+ /**
+  * The tavern's proxy, for 自己的接口. A key sent as Authorization through a tavern behind a password login takes the
+  * login's place, and the browser asks for the tavern's password again and again: such a request is not sent.
+  */
+ async tavern(url,init,signal){if(Object.keys(init?.headers||{}).some(h=>/^authorization$/i.test(h))&&await(this.behindLogin??=tavernLogin(this.fetcher,this.page)))throw Object.assign(Error(KEY_BEHIND_LOGIN),{login:true});return this.proxy(url,init,signal);}
  /** How a service is asked while it is being set up (core/custom-detect.js): quickly, with the key if there is one. */
- customTools(){const key=this.currentKey('custom'),headers=key?{Authorization:'Bearer '+key}:{};
-  return {direct:(url,init={})=>this.fetcher(url,{credentials:'omit',referrerPolicy:'no-referrer',...(init.mode?{}:{headers}),signal:AbortSignal.timeout(init.mode?2500:6000),...init}),
-   proxy:this.proxy?url=>this.proxy(url,{method:'GET',headers},AbortSignal.timeout(8000)):null};}
+ customTools(set){const key=this.customKey(set),headers=key?{Authorization:'Bearer '+key}:{};
+  return {direct:(url,init={})=>this.fetcher(url,{credentials:'omit',referrerPolicy:'no-referrer',signal:AbortSignal.timeout(init.mode?2500:6000),...init,...(init.mode?{}:{headers:{...headers,...init.headers}})}),
+   proxy:this.proxy?(url,init={})=>this.tavern(url,{method:'GET',...init,headers:{...headers,...init.headers}},AbortSignal.timeout(8000)):null};}
  /** A Gradio app takes a reference audio by where it keeps it: uploaded once a page, asked again after anything failed. */
  async gradioUpload(request,audio,signal){
   const root=gradioRoot(request.url),slot=root+'|'+request.refFile;this.gradioFiles??=new Map();
@@ -235,10 +279,12 @@ export class Providers{
  }
  /** 自己的接口's voices: the ones added by hand, and (音色列表地址) the ones the service lists. */
  async customVoiceList(c,search=''){
+  // The set of the connection asked with (a role's own, by model, else the one in use).
+  const set=customSetOf(c,c?.model);c={params:{...P.defaults('custom'),...customParams(c,set)}};
   const own=customVoices(c),q=search.trim().toLowerCase();let listed=[],note='';
   const url=String(c.params.listUrl||'').trim();
-  if(proxyAddress(url)||/^https?:\/\//i.test(url)){const {url:target,init}=customInit({url,method:'GET',headers:String(c.params.headers||'')},this.currentKey('custom'));
-   let r=await fetchWithPolicy(this.fetcher,target,init).catch(()=>null);if(!r&&this.proxy)r=await this.proxy(target,init).catch(()=>null);
+  if(proxyAddress(url)||/^https?:\/\//i.test(url)){const {url:target,init}=customInit({url,method:'GET',headers:String(c.params.headers||'')},this.customKey(set));
+   let r=await fetchWithPolicy(this.fetcher,target,init).catch(()=>null);if(!r&&this.proxy){r=await this.tavern(target,init).catch(()=>null);if(r&&noTavernProxy(await r.clone().text().catch(()=>'')))r=null;}
    if(!r)note='音色列表地址连不上';else if(!r.ok)note='音色列表地址回答 HTTP '+r.status;else{try{listed=readVoiceList(await r.json(),String(c.params.listPath||'').trim());}catch{note='音色列表回的不是 JSON';}}
    listed=listed.filter(v=>!own.some(o=>o.id===v.id));}
   const all=[...own,...listed];
@@ -274,7 +320,7 @@ export class Providers{
  static voiceInfo(engine,v){const list=x=>Array.isArray(x)?x.filter(y=>typeof y==='string'):[];const parts=engine==='fish'?[v.description,list(v.tags).join(' '),list(v.languages).join('/')]:engine==='mini'?[Array.isArray(v.description)?list(v.description).join('；'):v.description]:[Object.values(v.labels&&typeof v.labels==='object'?v.labels:{}).filter(x=>typeof x==='string').join(' '),v.description];return parts.filter(x=>typeof x==='string'&&x.trim()).map(x=>x.trim().replace(/\s+/g,' ')).join(' · ').slice(0,240);}
  async voices(engine,c,{search='',page=0,token=''}={}){
   if(engine==='doubao'){const q=search.trim().toLowerCase(),saved=(c.params.voices||[]).filter(v=>v.id?.trim()).map(v=>({id:v.id.trim(),name:v.name.trim()||v.id.trim()})),all=[...saved,...(c.model==='seed-tts-2.0'?DOUBAO_VOICES:[])].filter((v,i,rows)=>rows.findIndex(x=>x.id===v.id)===i);return {voices:all.filter(v=>!q||(v.id+' '+v.name).toLowerCase().includes(q)),more:false,token:'',note:'本地音色列表；可直接粘贴控制台的音色 ID，这里不校验密钥或音色授权'};}
-  if(engine==='custom')return this.customVoiceList({params:{...P.defaults('custom'),...c?.params}},search);
+  if(engine==='custom')return this.customVoiceList(c,search);
   if(engine==='fish'&&P.fishOpenAI(c))throw Error('这个中转（OpenAI 格式）没有音色列表：在角色的「音色」里直接填 Fish 的音色 ID（fish.audio 网站上音色页面地址里那串字母数字）');
   if(engine==='mimo'){const mode=P.mimoMode(c.model),q=search.trim().toLowerCase();const all=mode==='preset'?P.vocab.MIMO_VOICES.map(([id,name])=>({id,name})):mode==='clone'?c.params.samples.filter(x=>String(x.name).trim()).map(x=>({id:String(x.name).trim(),name:String(x.name).trim()+' · 克隆样本'})):[];
    return {voices:q?all.filter(v=>v.name.toLowerCase().includes(q)):all,more:false,token:'',note:mode==='design'?'音色设计模型没有音色列表：在「音色」一栏写音色描述':mode==='clone'?'克隆样本在 MiMo 引擎里上传':'MiMo 内置音色'};}

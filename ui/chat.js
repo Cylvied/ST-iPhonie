@@ -7,18 +7,19 @@ import {fly} from './carry.js';
 import {openImageViewer} from '../image-viewer.js';
 import {viewerHeart} from './photo-heart.js';
 import {editTags} from '../host-ask.js';
-import {saveFile, downloadAction, shareAction, shareFile, canShareFiles} from '../download.js';
+import {saveFile, downloadAction, shareFile, canShareFiles} from '../download.js';
 import {momentsPanel, momentsNew, momentsSeen} from './moments.js';
 import {PROFILE_STATUS, BUBBLES, FRAMES, BACKGROUNDS, parseStickers} from '../core/chat.js';
 import {callSummary} from '../core/call.js';
-import {preview, BLESSING, you, patText, noticeText, seconds} from './chat-preview.js';
+import {preview, BLESSING, patText, noticeText, seconds} from './chat-preview.js';
 import {pendant} from './pendants.js';
 import {memorySheet} from './chat-memory.js';
 import {pictureInputs, photoTags, photoPicture} from '../core/draw.js';
 import {chatScene, sceneArt, sceneDark, syncMotion} from './chat-scenes.js';
 import {PREMIUM, yuan} from '../core/wallet.js';
 import {fileTool, fileBody, showFile, filesToMessages} from './chat-files.js';
-import {thumbBlob, previewBlob} from './thumbs.js';
+import {eachThumb, previewBlob} from './thumbs.js';
+import {photoWall} from './photo-wall.js';
 export {preview};
 
 // Chat app, QQ style: 消息 (conversations, with search, 置顶 and 免打扰), 联系人 (特别关心, friends, groups, profile cards)
@@ -31,7 +32,9 @@ export {preview};
 // turns into 让对方回复 and asks the model. Replies come from the host (api.chatReply); outside the tavern the app still
 // stores and shows chats.
 
-const clock = at => new Date(at).toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit', hour12: false});
+// One formatter for every message: making one costs far more than using it.
+const CLOCK = new Intl.DateTimeFormat('zh-CN', {hour: '2-digit', minute: '2-digit', hour12: false});
+const clock = at => { const d = new Date(at); return Number.isNaN(d.getTime()) ? '' : CLOCK.format(d); };
 function stamp(at) {
   const d = new Date(at), now = new Date();
   if (d.toDateString() === now.toDateString()) return clock(at);
@@ -54,8 +57,10 @@ const KAOMOJI = ['(｡•̀ᴗ-)✧', '(╥﹏╥)', '(๑•̀ㅂ•́)و✧', 
 export function chatApp(ctx) {
   const {api} = ctx, v = createView(ctx, 'chat');
   // 备注: what the user calls a contact, shown in the chat app only (the models keep using the real name).
-  const remarks = () => api.getState().chat.remarks || {};
-  const shown = name => name === 'me' ? name : remarks()[name] || name;
+  const remarks = () => api.readState().chat.remarks || {};
+  /** What a person's avatar and 备注 are kept under: their name, or a key of their own when another card has someone of that name. */
+  const ownKey = name => ctx.routeFor?.(name)?.ownKey || name;
+  const shown = name => name === 'me' ? name : remarks()[ownKey(name)] || name;
   const you = who => who === 'me' ? '你' : shown(who);
   // mode: list (the tabs) · thread · profile (a contact's card) · me (the user's card and 个性装扮) · contact-edit
   // selecting: the messages picked (null when not picking); pickFor: what for, 'bring' (带进剧情) or 'delete' (多选删除).
@@ -65,9 +70,9 @@ export function chatApp(ctx) {
   let unreadTotal = 0, freshMoments = 0;
   let panel = null, quote = null;
   const drafts = new Map(), live = typeof api.chatReply === 'function';
-  const photoURLs = new Map(), bubbleURLs = new Map(), recalled = new Map(), transcribed = new Set();
+  const photoURLs = new Map(), bubbleURLs = new Map(), photoSizes = new Map(), recalled = new Map(), transcribed = new Set();
   let press = null, pressedAt = 0;
-  const voiceText = () => api.getState().chat.voiceText || {mode: 'translation', auto: false};
+  const voiceText = () => api.readState().chat.voiceText || {mode: 'translation', auto: false};
   /** 转文字 for a voice message: the translation, the original line, or both (original first). */
   function transcriptHTML(m) {
     // The engine's own marks ([sigh], <whisper>…</whisper>, (laughing), <#0.5#>) are for the voice, not for reading.
@@ -78,7 +83,7 @@ export function chatApp(ctx) {
   }
 
   // ---------- The user (我) ----------
-  const profile = () => api.getState().chat.profile;
+  const profile = () => api.readState().chat.profile;
   const myName = () => profile().name || api.userName?.() || '我';
   let switchTimer = 0;
   const myAvatar = size => `<span class="me-av" data-frame="${esc(profile().frame)}" style="--s:${size}px">${avatar(myName(), 'none', size, 'me')}${pendant(profile().frame)}</span>`;
@@ -144,7 +149,6 @@ export function chatApp(ctx) {
       if (mode === 'thread' && threadId === pace.thread) render();
     }, typeTime(m, first));
   }
-  const partner = () => thread.type === 'group' ? '群里' : thread.members[0];
   /**
    * 带进剧情: 这一次 (pick messages for the next story reply, once) or 一直带着 (the story always knows this chat: its
    * memory and whatever is not written up yet). Both can be on; what is picked goes in word for word as well.
@@ -246,7 +250,7 @@ export function chatApp(ctx) {
   }
   /** ＋ in 联系人: a role from the 角色 App that is not here yet, or someone outside the story by hand. */
   function addContact() {
-    const here = new Set(api.chatContacts().map(c => c.name)), roles = api.getState().routes.filter(r => r.name?.trim() && !here.has(r.name));
+    const here = new Set(api.chatContacts().map(c => c.name)), roles = (api.rolesHere?.() || api.getState().routes).filter(r => r.name?.trim() && !here.has(r.name));
     const d = ctx.dialog('添加联系人', `<div class="pick-list">
       ${roles.map(r => `<button class="list-row" data-add-role="${esc(r.name)}">${avatar(r.name, r.voice ? r.engine : 'none', 36)}<span><strong>${esc(r.name)}</strong><small>角色 App 里的角色${r.voice ? ' · 能发语音' : ''}</small></span>${icon('add')}</button>`).join('')}
       <button class="list-row" data-add-role="">${icon('edit')}<span><strong>手动添加</strong><small>剧情之外的人（同学、店员、网友……），写上人设就能聊</small></span></button></div>
@@ -274,7 +278,7 @@ export function chatApp(ctx) {
     v.draw(`<div class="qq-card" data-engine="${c.engine}"><span class="qq-card-cover" aria-hidden="true"></span>${avatar(c.name, c.engine, 84)}<h2>${esc(shown(c.name))}</h2>${shown(c.name) !== c.name ? `<p class="qq-card-real">昵称：${esc(c.name)}</p>` : ''}<p>${esc(signatureOf(c))}</p>
         <div class="qq-card-tags"><span class="chip">${c.source === 'role' ? '角色' : '手动联系人'}</span>${c.voice ? '<span class="chip">能发语音</span>' : ''}${star ? '<span class="chip">★ 特别关心</span>' : ''}</div></div>
       <div class="actions">${btn('profile-chat', icon('chat') + '发消息', 'primary')}${api.callDial ? btn('profile-call', icon('phone') + '打电话', 'secondary') : ''}${btn('profile-moments', icon('moments') + 'TA 的动态', 'secondary')}</div>
-      <div class="group">${btn('remark', `${icon('edit')}<span><strong>设置备注</strong><small>${esc(remarks()[c.name] || '只有你看得到，聊天里显示这个名字')}</small></span>`, 'list-row')}${btn('avatar-pick', `${icon('image')}<span><strong>换头像</strong><small>${esc(avatarState(c.name))}</small></span>`, 'list-row', `data-key="${esc(c.name)}"`)}${btn('star', `<span>${star ? '★ 取消特别关心' : '☆ 设为特别关心'}</span>`, 'list-row')}${manual ? `<button class="list-row" data-action="contact-edit" data-id="${esc(manual.id)}">${icon('edit')}<span><strong>编辑资料和人设</strong></span></button>` : ''}</div>
+      <div class="group">${btn('remark', `${icon('edit')}<span><strong>设置备注</strong><small>${esc(remarks()[ownKey(c.name)] || '只有你看得到，聊天里显示这个名字')}</small></span>`, 'list-row')}${btn('avatar-pick', `${icon('image')}<span><strong>换头像</strong><small>${esc(avatarState(c.name))}</small></span>`, 'list-row', `data-key="${esc(c.name)}"`)}${btn('star', `<span>${star ? '★ 取消特别关心' : '☆ 设为特别关心'}</span>`, 'list-row')}${manual ? `<button class="list-row" data-action="contact-edit" data-id="${esc(manual.id)}">${icon('edit')}<span><strong>编辑资料和人设</strong></span></button>` : ''}</div>
       <div class="actions">${btn('unfriend', '删除好友', 'danger')}</div>`);
     listeningOf(c.name).then(song => { const box = v.root.querySelector('.qq-card'); if (!song || !box || profileOf !== c.name || mode !== 'profile') return; box.insertAdjacentHTML('beforeend', `<button type="button" class="qq-listening" data-action="play-song" data-title="${esc(song.title)}" data-artist="${esc(song.artist)}">${icon('music')}<span>最近在听：${esc(song.title)}${song.artist ? ' - ' + esc(song.artist) : ''}</span></button>`); }).catch(() => {});
   }
@@ -351,7 +355,7 @@ export function chatApp(ctx) {
     switch (m.kind) {
       case 'voice': return `<button class="voice-msg" data-action="voice" ${mid} data-state="ungenerated" aria-label="播放 ${esc(m.from)} 的语音"><span class="v-ico">${icon('play', true)}</span><span class="v-wave">${WAVE_HEIGHTS.map(h => `<i style="height:${h}px"></i>`).join('')}</span><span class="v-sec">${seconds(m)}″</span></button>${voiceText().auto || transcribed.has(m.id) ? transcriptHTML(m) : ''}`;
       case 'photo': return m.photoId
-        ? `<button class="chat-photo" data-action="photo" ${mid} aria-label="查看照片"><img data-chat-photo="${esc(m.photoId)}" alt="${esc(m.text || '照片')}"></button>`
+        ? `<button class="chat-photo" data-action="photo" ${mid}${photoSizes.has(m.photoId) ? ` style="${photoSizes.get(m.photoId)}"` : ''} aria-label="查看照片"><img data-chat-photo="${esc(m.photoId)}"${bubbleURLs.get(m.photoId) ? ` src="${esc(bubbleURLs.get(m.photoId))}"` : ''} alt="${esc(m.text || '照片')}"></button>`
         : `<button class="chat-photo described" data-action="message" ${mid}><span class="ph-art">${icon('image')}</span><span class="ph-cap">${esc(m.text)}</span></button>${photoNote(m)}`;
       case 'file': return fileBody(m, mid);
       // A sticker: the picture without a bubble; its name when the picture cannot be loaded.
@@ -374,7 +378,7 @@ export function chatApp(ctx) {
         const fresh = Date.now() - m.at < 1500;
         return `<button class="dice-msg${fresh ? ' rolling' : ''}" data-action="message" ${mid} data-face="${esc(m.text)}" aria-label="骰子 ${esc(m.text)} 点">${Array.from({length: 9}, (_, i) => `<i${PIPS[m.text]?.includes(i) ? ' class="on"' : ''}></i>`).join('')}</button>`;
       }
-      case 'song': return `<button class="song-card" data-action="song" ${mid} aria-label="播放 ${esc(m.song?.title || '')}"><span class="sg-disc" aria-hidden="true">${icon('music')}</span><span class="sg-text"><strong>${esc(m.song?.title || '')}</strong><small>${esc(m.song?.artist || '')}</small>${m.text ? `<em>${esc(m.text)}</em>` : ''}</span><span class="sg-play" aria-hidden="true">${icon('play', true)}</span></button>`;
+      case 'song': return `<button class="song-card" data-action="song" ${mid} aria-label="播放 ${esc(m.song?.title || '')}"><span class="sg-disc" aria-hidden="true">${icon('music')}</span><span class="sg-text"><strong>${esc(m.song?.title || '')}</strong><small>${esc(m.song?.artist || '')}</small>${m.text ? `<em>${esc(m.text)}</em>` : ''}</span><span class="sg-play" aria-hidden="true">${icon(m.song?.draft ? 'edit' : 'play', !m.song?.draft)}</span></button>`;
       case 'call': return `<button class="call-msg${m.state === 'answered' ? '' : ' missed'}" data-action="call-log" ${mid}>${icon('phone', true)}<span>${esc(callSummary(m))}</span></button>`;
       default: return `<button class="chat-bubble" data-action="message" ${mid}>${esc(m.text)}</button>`;
     }
@@ -414,7 +418,7 @@ export function chatApp(ctx) {
   function toolsHTML() {
     const group = thread.type === 'group';
     const tools = [['photo', 'image', '照片'], ['emoji', 'smile', '表情'], ['redpacket', 'packet', '红包'], ...(group ? [] : [['transfer', 'swap', '转账'], ['gift', 'gift', '礼物']]),
-      ['file', 'file', '文件'], ['location', 'pin', '位置'], ['song', 'music', '分享歌'], ['pat', 'hand', '拍一拍'], ['dice', 'dice', '骰子']];
+      ['file', 'file', '文件'], ['location', 'pin', '位置'], ['song', 'music', '分享歌'], ['write', 'edit', '写首歌'], ['pat', 'hand', '拍一拍'], ['dice', 'dice', '骰子']];
     const tabs = `<div class="emoji-tabs" role="tablist">${[['emoji', '表情'], ['stickers', '表情包']].map(([k, t]) => `<button type="button" role="tab" data-action="panel-${k}" aria-selected="${panel === k}">${t}</button>`).join('')}</div>`;
     if (panel === 'stickers') {
       const list = api.getState().chat.stickers || [];
@@ -617,12 +621,9 @@ export function chatApp(ctx) {
 
   /** A picker's photos as small pictures (ui/thumbs.js), let go when the picker closes. */
   function pickerThumbs(d, rows) {
-    const urls = [], byId = new Map(rows.map(r => [r.id, r]));
+    const urls = [], imgs = new Map([...d.body.querySelectorAll('img[data-chat-photo]')].map(img => [img.dataset.chatPhoto, img]));
     d.onClose(() => { for (const url of urls) ctx.win.URL.revokeObjectURL(url); });
-    for (const img of d.body.querySelectorAll('img[data-chat-photo]')) {
-      const row = byId.get(img.dataset.chatPhoto);
-      if (row) thumbBlob(api, row).then(blob => { if (!blob || !d.live) return; const url = ctx.win.URL.createObjectURL(blob); urls.push(url); img.src = url; });
-    }
+    eachThumb(api, rows.filter(r => imgs.has(r.id)), (id, blob) => { const url = ctx.win.URL.createObjectURL(blob); urls.push(url); imgs.get(id).src = url; }, () => d.live).catch(() => {});
   }
   // Album photos sent in the chat; each picture is read once and kept while the app is open. A bubble shows the photo's
   // middle-sized picture once one was made (ui/thumbs.js); the viewer, downloads and the chat background the photo itself.
@@ -641,10 +642,14 @@ export function chatApp(ctx) {
     return bubbleURLs.get(id);
   }
   async function paintPhotos() {
+    // A photo seen before comes with the page, in the place it had: scrolled back up a chat, a new message would otherwise throw the page out of where it was.
     for (const img of v.root.querySelectorAll('img[data-chat-photo]')) {
-      const url = await bubbleURL(img.dataset.chatPhoto);
+      const id = img.dataset.chatPhoto, url = await bubbleURL(id);
       if (!img.isConnected) continue;
-      if (url) img.src = url; else img.closest('.chat-photo')?.classList.add('missing');
+      if (!url) { img.closest('.chat-photo')?.classList.add('missing'); continue; }
+      if (img.getAttribute('src') === url) continue;
+      img.addEventListener('load', () => { if (img.offsetWidth && img.offsetHeight) photoSizes.set(id, `width:${img.offsetWidth}px;height:${img.offsetHeight}px`); }, {once: true});
+      img.src = url;
     }
   }
 
@@ -728,9 +733,10 @@ export function chatApp(ctx) {
   };
 
   async function sendPhoto() {
-    const rows = await api.listPhotos(), local = [];
+    const rows = await api.listPhotos();
     let chosen = null;
-    const d = sheet('发送照片', `<div class="photo-grid pick-photos">${rows.map(r => `<button data-action="pick-photo" data-id="${esc(r.id)}" aria-pressed="false" aria-label="选择 ${esc(r.name)}"><img data-photo="${esc(r.id)}" alt="${esc(r.name)}"></button>`).join('')}</div>
+    const pieces = photoWall({api, win: ctx.win, tile: (r, url) => `<button data-action="pick-photo" data-id="${esc(r.id)}" aria-pressed="${chosen === r.id}" aria-label="选择 ${esc(r.name)}"><img decoding="async" data-photo="${esc(r.id)}" alt="${esc(r.name)}"${url ? ` src="${esc(url)}"` : ''}></button>`});
+    const d = sheet('发送照片', `${pieces.html([{rows}], ' pick-photos')}
       ${rows.length ? '' : '<p class="help-copy">相册里还没有照片，可以直接从本地选一张。</p>'}
       <div class="actions"><label class="secondary file-button">${icon('import')}从本地选<input type="file" data-chat-file accept="image/png,image/jpeg,image/webp,image/avif,image/gif" aria-label="从本地选照片"></label></div>
       ${field('照片说明', input('caption', '', 'text', 'maxlength="200" placeholder="比如：下班路上的晚霞"'), '现在的模型看不到图片本身，只看得到这句说明，写清楚照片里有什么，对方才好接话。\n\n想让对方直接看图：用能识图的模型（比如 Gemini、Claude、GPT-4o 这类），并在酒馆的「AI 回复配置」里打开「发送内联媒体」；用小手机自己的文字连接时，只要模型能识图就行。')}
@@ -747,7 +753,8 @@ export function chatApp(ctx) {
         await post([{from: 'me', kind: 'photo', photoId: chosen, text: caption}]);
       }
     });
-    d.onClose(() => { for (const url of local) ctx.win.URL.revokeObjectURL(url); });
+    pieces.mount(d.body);
+    d.onClose(() => pieces.stop());
     api.chatSeesPictures?.().then(yes => { const box = d.body.querySelector('[data-field=caption]'), info = box?.closest('.field')?.querySelector('.info'); if (!yes || !box) return; box.placeholder = '可以不写，对方看得到照片'; info?.setAttribute('data-help', '现在的模型能看图，对方会直接看到这张照片；说明可以不写，写了就当作你配的话。'); }).catch(() => {});
     d.body.addEventListener('change', e => {
       const file = e.target.closest('[data-chat-file]')?.files?.[0];
@@ -758,12 +765,6 @@ export function chatApp(ctx) {
         await post([{from: 'me', kind: 'photo', photoId: photo.id, text: caption}]);
       }).catch(error => ctx.notify(error.message));
     });
-    for (const row of rows) {
-      const blob = await thumbBlob(api, row);
-      if (!d.live) return;
-      const img = [...d.body.querySelectorAll('img[data-photo]')].find(x => x.dataset.photo === row.id);
-      if (blob && img) { const url = ctx.win.URL.createObjectURL(blob); local.push(url); img.src = url; }
-    }
   }
   function sendPacket() {
     const d = sheet('发红包', `<div class="packet-sheet">${field('金额', input('amount', '6.66', 'text', 'inputmode="decimal" maxlength="9"'))}${field('祝福语', input('blessing', '', 'text', `maxlength="40" placeholder="${BLESSING}"`))}</div>
@@ -816,6 +817,33 @@ export function chatApp(ctx) {
         const text = value(d, 'note');
         d.close();
         await post([{from: 'me', kind: 'song', song, ...(text ? {text} : {})}]);
+      }
+    });
+  }
+  /** A song written in a chat: played once it has been sung, else its page, to read and sing. False when its draft has gone. */
+  async function openWritten(song) {
+    const draft = await api.getSongDraft?.(song.draft).catch(() => null);
+    if (!draft) return false;
+    const made = draft.songs.length ? (await api.listSongs().catch(() => [])).find(s => s.id === draft.songs.at(-1)) : null;
+    if (made) { api.musicPlayList?.([made], 0, 'library').catch(error => ctx.notify(error.message, {error: true})); return true; }
+    ctx.showSongDraft?.(song.draft);
+    return true;
+  }
+  /** Someone in the chat writes a song: the text model writes it as them, and a card comes from them. It is sung from its page, and only then costs anything. */
+  function writeSong() {
+    const group = thread.type === 'group', remembered = api.getState().music.writing, id = threadId;
+    const d = sheet('写首歌', `${group ? field('谁写', `<span class="select"><select data-field="who" aria-label="谁写">${thread.members.map(n => `<option value="${esc(n)}">${esc(shown(n))}</option>`).join('')}</select></span>`) : ''}
+      ${field('写什么', textArea('about', '', 'rows="3" maxlength="2000" placeholder="比如：写写我们第一次见面那天。不填就让 TA 自己想"'))}
+      ${field('语言', input('language', remembered.language, 'text', 'maxlength="200"'))}
+      ${field('曲风', input('genre', remembered.genre, 'text', 'maxlength="200" placeholder="可以不填，TA 自己定"'))}
+      <div class="actions">${btn('song-write', icon('send') + '让 TA 写', 'primary')}</div>
+      <p class="hint">会调用一次文字模型。写好以后是一张歌卡，点开能看歌词、唱出来。</p>`, {
+      'song-write': () => {
+        if (!api.songWriteFor) throw Error('要在酒馆里打开小手机，才能让 TA 写');
+        const form = {...remembered, who: group ? value(d, 'who') : thread.members[0], about: value(d, 'about'), language: value(d, 'language'), genre: value(d, 'genre')};
+        d.close();
+        ctx.notify(`${shown(form.who)}在写了，写好了会发过来`);
+        api.songWriteFor(id, form).catch(error => ctx.notify(error.message, {error: true}));
       }
     });
   }
@@ -1164,20 +1192,20 @@ export function chatApp(ctx) {
   }
   /** Where an avatar comes from, in words. */
   function avatarState(key) {
-    const chosen = api.getState().chat.avatars?.[key];
+    const chosen = api.getState().chat.avatars?.[ownKey(key)];
     if (chosen?.kind === 'photo') return '用的是相册里的照片';
     if (chosen?.kind === 'text') return '只显示文字';
     return avatarPicture(key) ? (key === 'me' ? '用的是酒馆里当前人设的头像' : '用的是酒馆角色卡的头像') : '只显示文字（酒馆里没有这个头像）';
   }
   /** Picks an avatar for the user ('me') or a contact: an album photo, a new picture, the tavern's avatar, or text. */
   async function avatarSheet(key, {title = '', reset = '用酒馆的头像'} = {}) {
-    const rows = (await api.listPhotos()).slice(0, 30), who = key === 'me' ? '我' : key, chosen = api.getState().chat.avatars?.[key];
+    const rows = (await api.listPhotos()).slice(0, 30), who = key === 'me' ? '我' : key, store = ownKey(key), chosen = api.getState().chat.avatars?.[store];
     const d = ctx.dialog(title || `${who}的头像`, `<p class="help-copy">点一张照片，或者上传一张新的。</p>
       <label class="secondary file-button">${icon('import')}上传图片<input type="file" accept="image/*" data-avatar-file hidden></label>
       ${rows.length ? `<div class="photo-grid pick-photos">${rows.map(r => `<button data-avatar-photo="${esc(r.id)}" aria-label="用 ${esc(r.name)} 当头像"${chosen?.photoId === r.id ? ' aria-pressed="true"' : ''}><img data-chat-photo="${esc(r.id)}" alt=""></button>`).join('')}</div>` : '<p class="hint">相册里还没有照片。</p>'}
       <div class="actions">${btn('avatar-tavern', reset, 'secondary')}${btn('avatar-text', '只显示文字', 'text-button')}</div>`);
     pickerThumbs(d, rows);
-    const choose = value => { d.close(); api.saveChatOptions({avatars: {[key]: value}}); ctx.notify('头像已换好'); };
+    const choose = value => { d.close(); api.saveChatOptions({avatars: {[store]: value}}); ctx.notify('头像已换好'); };
     d.body.addEventListener('click', e => {
       const photo = e.target.closest('[data-avatar-photo]')?.dataset.avatarPhoto;
       if (photo) return choose({kind: 'photo', photoId: photo});
@@ -1476,7 +1504,7 @@ export function chatApp(ctx) {
       case 'dm-open': await openDm(el.dataset.name); break;
       case 'profile': profileOf = el.dataset.name; mode = 'profile'; render(); break;
       case 'profile-chat': await openDm(profileOf); break;
-      case 'song': { const m = thread?.messages.find(x => x.id === el.dataset.mid); if (m?.song) { ctx.notify(`正在找「${m.song.title}」……`); api.musicPlay?.({...m.song, from: 'share'}).catch(error => ctx.notify(error.message, {error: true})); } break; }
+      case 'song': { const m = thread?.messages.find(x => x.id === el.dataset.mid); if (m?.song?.draft && await openWritten(m.song)) break; if (m?.song) { ctx.notify(`正在找「${m.song.title}」……`); api.musicPlay?.({...m.song, from: 'share'}).catch(error => ctx.notify(error.message, {error: true})); } break; }
       case 'play-song': api.musicPlay?.({title: el.dataset.title, artist: el.dataset.artist, from: 'share'}).catch(error => ctx.notify(error.message, {error: true})); break;
       case 'unfriend': {
         const name = profileOf;
@@ -1487,12 +1515,12 @@ export function chatApp(ctx) {
       }
       case 'new-friends': mode = 'friends'; render(); break;
       case 'remark': {
-        const name = profileOf, d = ctx.dialog('设置备注', `<div class="group pad">${field('备注', input('remark', remarks()[name] || '', 'text', `maxlength="20" placeholder="${esc(name)}"`), '只改你这边显示的名字（聊天列表、聊天、联系人）；角色那边还是用 TA 的名字，不会知道你给 TA 起了什么备注。空着就是不用备注。')}
+        const name = profileOf, d = ctx.dialog('设置备注', `<div class="group pad">${field('备注', input('remark', remarks()[ownKey(name)] || '', 'text', `maxlength="20" placeholder="${esc(name)}"`), '只改你这边显示的名字（聊天列表、聊天、联系人）；角色那边还是用 TA 的名字，不会知道你给 TA 起了什么备注。空着就是不用备注。')}
           <div class="actions">${btn('remark-save', '保存', 'primary')}</div></div>`);
         d.body.addEventListener('click', e => {
           if (!e.target.closest('[data-action=remark-save]')) return;
           const value = d.body.querySelector('[data-field=remark]').value.trim();
-          try { api.saveChatOptions({remarks: {[name]: value || null}}); d.close(); ctx.notify(value ? `备注改成「${value}」` : '不用备注了'); render(); } catch (error) { ctx.notify(error.message, {error: true}); }
+          try { api.saveChatOptions({remarks: {[ownKey(name)]: value || null}}); d.close(); ctx.notify(value ? `备注改成「${value}」` : '不用备注了'); render(); } catch (error) { ctx.notify(error.message, {error: true}); }
         });
         break;
       }
@@ -1548,6 +1576,7 @@ export function chatApp(ctx) {
       case 'tool-gift': panel = null; syncPanel(); sendGift(); break;
       case 'tool-location': panel = null; syncPanel(); sendLocation(); break;
       case 'tool-song': panel = null; syncPanel(); await shareSong(); break;
+      case 'tool-write': panel = null; syncPanel(); writeSong(); break;
       case 'tool-page': { const box = el.closest('.chat-panel')?.querySelector('.tool-pages'); box?.scrollTo({left: Number(el.dataset.page) * box.clientWidth, behavior: 'smooth'}); break; }
       case 'tool-pat': panel = null; syncPanel(); await choosePat(); break;
       case 'tool-dice': panel = null; syncPanel(); await rollDice(); break;

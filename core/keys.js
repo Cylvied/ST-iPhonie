@@ -1,6 +1,6 @@
 // Voice engines, NovelAI for drawing, and llm: the phone's own text model (an OpenAI-compatible API).
 import {connectionLost} from './idb.js';
-const engines=['fish','mini','eleven','mimo','doubao','custom','nai','llm','gpt','embed','runninghub'];
+const engines=['fish','mini','eleven','mimo','doubao','custom','nai','llm','gpt','embed','stepfun','lyria','replicate','runninghub'];
 // Keys copied from web pages and chat apps often carry invisible characters (zero-width spaces, line breaks), full-width
 // letters typed with a Chinese input method, quotes, or a "Bearer " prefix. No key contains any of these, and a service
 // answers such a key with 401 although the key itself is valid, so they are taken out before the key is kept or sent.
@@ -17,7 +17,7 @@ function checkKey(key){if(key.length>4096)throw Error('密钥格式无效');if(/
 export function parseTextKeys(value){const out=new Map();for(const line of String(value??'').split('\n')){if(!line.trim())continue;const at=line.indexOf('\t'),id=at<0?'default':line.slice(0,at).trim(),key=checkKey(cleanKey(at<0?line:line.slice(at+1)));if(/^[\w-]{1,64}$/.test(id)&&key)out.set(id,key);}return out;}
 export const joinTextKeys=map=>[...map].filter(([,key])=>key).map(([id,key])=>id+'\t'+key).join('\n');
 export function validateKey(engine,value){if(!engines.includes(engine))throw Error('引擎无效');
- if(engine==='llm'||(['nai','gpt'].includes(engine)&&String(value??'').includes('\t')))return joinTextKeys(parseTextKeys(value));
+ if(engine==='llm'||(['nai','gpt','custom'].includes(engine)&&String(value??'').includes('\t')))return joinTextKeys(parseTextKeys(value));
  // Several keys come one per line (commas, semicolons and spaces also separate them); repeats are kept once, in order.
  if(MULTI_KEY.has(engine)){const keys=[...new Set(String(value??'').normalize('NFKC').split(/[\s,;，；、]+/).map(cleanKey).filter(part=>part&&!/^bearer$/i.test(part)))];if(keys.length>50)throw Error('最多填 50 个密钥');return keys.map(checkKey).join('\n');}
  return checkKey(cleanKey(value));}
