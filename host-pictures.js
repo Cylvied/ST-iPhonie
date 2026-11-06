@@ -24,6 +24,8 @@ import {drawQueueChannel, DRAW_ENGINE_NAMES} from './core/image-engines.js';
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const versionsOf = record => !record ? [] : Array.isArray(record.versions) ? record.versions : record.url ? [{...record}] : [];
+// An unset swipe_id and zero both identify the first reply variant.
+const swipeOf = message => typeof message?.swipe_id === 'number' ? message.swipe_id : 0;
 
 /**
  * voice: 回复后单独配音 ({wanted(), has(text), rules(), format()}): whether it is on, whether a reply already has its
@@ -152,11 +154,11 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
 
   /** Queues one picture. Redrawing adds a version; the earlier versions stay. */
   async function generate(id, tag, {interactive = false, permission = null, message = context().chat[id]} = {}) {
-    const ctx = context(), owner = chatId(ctx), swipe = message?.swipe_id, key = jobKey(id, tag);
+    const ctx = context(), owner = chatId(ctx), swipe = swipeOf(message), key = jobKey(id, tag);
     if (!message || jobs.get(key)?.state === 'generating') return;
     const valid = () => {
       const now = context();
-      return owner === chatId(now) && now?.chat[id] === message && message.swipe_id === swipe && parsePictures(message.mes).some(t => t.hash === tag.hash);
+      return owner === chatId(now) && now?.chat[id] === message && swipeOf(message) === swipe && parsePictures(message.mes).some(t => t.hash === tag.hash);
     };
     if (!valid()) return;
     permission ??= await allowed(interactive);

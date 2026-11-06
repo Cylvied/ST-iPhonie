@@ -30,13 +30,54 @@ function setup(t, engine, url = '') {
   });
   const host = createPictureHost({context: () => current, settings: () => ({draw, routes: [], general: {}}),
     backend, marker: 'story-test', scheduleRender() {}, notice: assert.fail});
-  return {host, backend, ctx, floor, requests, uploads, saved, switchChat() {
+  return {host, backend, draw, ctx, floor, requests, uploads, saved, switchChat() {
     current = {...ctx, chat: [message()], name2: 'Second', getCurrentChatId: () => 'second'};
     return current;
   }};
 }
 
 for (const [channel, engine, url] of [['GPT', 'gpt', ''], ['RunningHub', 'comfy', RUNNINGHUB_URL]]) {
+  for (const nextSwipe of [0, 1]) {
+    test(channel + (nextSwipe === 0
+      ? ' automatic pictures survive first-swipe initialization while queued'
+      : ' automatic pictures are cancelled when the user selects another swipe'), async t => {
+      const {host, backend, draw, floor, requests, uploads, saved} = setup(t, engine, url);
+      Object.assign(draw, {enabled: true, auto: true, mode: 'inline'});
+      floor.mes = '<think_nya>Example <img>hidden</img></think_nya>\n<game>' + floor.mes + '</game>';
+      backend.drawQueue = new DrawQueue({concurrency: () => 1});
+      const makeImage = backend.generateImage;
+      const route = channel.toLowerCase();
+      backend.generateImage = input => backend.drawQueue.add({
+        key: input.key, channel: route, task() {
+          if (!input.valid()) throw Object.assign(Error('Message changed'), {cancelled: true});
+          return makeImage(input);
+        }
+      });
+      let finishEarlier;
+      const earlier = backend.drawQueue.add({channel: route, task: () => new Promise(resolve => { finishEarlier = resolve; })});
+      const automatic = host.autoPictures(0);
+      await tick();
+      assert.equal(floor.swipe_id, undefined);
+      assert.equal(backend.drawQueue.list().length, 3);
+      assert.equal(requests.length, 0);
+      floor.swipe_id = nextSwipe;
+      finishEarlier();
+      await earlier;
+      await tick();
+      if (nextSwipe === 0) {
+        assert.equal(requests.length, 1);
+        requests[0].finish();
+        await tick();
+        assert.equal(requests.length, 2);
+        requests[1].finish();
+      }
+      await automatic;
+      assert.equal(requests.length, nextSwipe === 0 ? 2 : 0);
+      assert.equal(uploads.length, nextSwipe === 0 ? 2 : 0);
+      assert.equal(saved.length, nextSwipe === 0 ? 2 : 0);
+    });
+  }
+
   test(channel + ' floor batches submit together, preserve tag ownership and serialize chat saves', async t => {
     const {host, ctx, floor, requests, uploads, saved} = setup(t, engine, url);
     const tags = parsePictures(floor.mes), submit = host.drawMessage(0);
