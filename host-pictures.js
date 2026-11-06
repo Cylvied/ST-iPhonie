@@ -21,11 +21,10 @@ import {voicePlanRequest, combinedRequest, insertVoiced} from './core/voice-plan
 import {withPhone, phoneSection} from './core/chat.js';
 import {TIER_NAMES, NAI_MODEL_NAMES} from './core/novelai.js';
 import {drawQueueChannel, DRAW_ENGINE_NAMES} from './core/image-engines.js';
+import {storyChatOwner, captureStoryPictureTarget, resolveStoryPictureTarget} from './core/story-picture-target.js';
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const versionsOf = record => !record ? [] : Array.isArray(record.versions) ? record.versions : record.url ? [{...record}] : [];
-// An unset swipe_id and zero both identify the first reply variant.
-const swipeOf = message => typeof message?.swipe_id === 'number' ? message.swipe_id : 0;
 
 /**
  * voice: 回复后单独配音 ({wanted(), has(text), rules(), format()}): whether it is on, whether a reply already has its
@@ -56,8 +55,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     message.extra.sttts_pics ??= {};
     message.extra.sttts_pics[hash] = list.length ? {versions: list, index: Math.min(list.length - 1, Math.max(0, index))} : {removed: true, versions: [], at: Date.now()};
   }
-  const chatId = ctx => ctx?.getCurrentChatId?.() ?? ctx?.chatId ?? '';
-  const jobKey = (id, tag) => `pic:${chatId(context())}:${id}:${tag.hash}`;
+  const jobKey = (id, tag, owner = storyChatOwner(context())) => `pic:${owner}:${id}:${tag.hash}`;
   const saveSoon = () => (context().saveChatDebounced || context().saveChat)?.();
   // Saving a floor writes the entire chat. Keep those writes ordered even when pictures finish together.
   let pictureSave = Promise.resolve();
@@ -153,33 +151,51 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
   }
 
   /** Queues one picture. Redrawing adds a version; the earlier versions stay. */
-  async function generate(id, tag, {interactive = false, permission = null, message = context().chat[id]} = {}) {
-    const ctx = context(), owner = chatId(ctx), swipe = swipeOf(message), key = jobKey(id, tag);
+  async function generate(id, tag, {interactive = false, permission = null, target, message = target?.message ?? context().chat[id], folder} = {}) {
+    const ctx = context();
+    // A viewer opened in another chat has no ownership snapshot for this request.
+    if (!target && ctx?.chat?.[id] !== message) return;
+    target ??= captureStoryPictureTarget(ctx, id);
+    folder ??= ctx.name2 || 'ST-iPhonie';
+    const key = jobKey(id, tag, target.owner);
     if (!message || jobs.get(key)?.state === 'generating') return;
-    const valid = () => {
-      const now = context();
-      return owner === chatId(now) && now?.chat[id] === message && swipeOf(message) === swipe && parsePictures(message.mes).some(t => t.hash === tag.hash);
+    let reportedInvalid = false;
+    const currentMessage = (stage = 'request') => {
+      const resolved = resolveStoryPictureTarget(context(), target), current = resolved.message;
+      let reason = resolved.reason;
+      if (!reason && !parsePictures(current.mes).some(t => t.hash === tag.hash)) reason = 'picture_changed';
+      if (!reason) return current;
+      if (!reportedInvalid) {
+        reportedInvalid = true;
+        backend.reportDiagnostic?.('正文出图任务失效', {reason, stage, messageId: id, picture: tag.index + 1}, 'warn');
+      }
+      return null;
     };
+    const valid = () => !!currentMessage();
     if (!valid()) return;
     permission ??= await allowed(interactive);
     if (!permission || !valid() || jobs.get(key)?.state === 'generating') return;
     jobs.set(key, {state: 'generating'});
     scheduleRender();
     try {
-      const inputs = pictureInputs(settings(), tag, message.mes);
+      const source = currentMessage('prepare');
+      if (!source) return;
+      const inputs = pictureInputs(settings(), tag, source.mes);
       const result = await backend.generateImage({...inputs, allowPaid: permission === 'paid', name: 'chat', key, valid, label: `正文图片 · 第 ${tag.index + 1} 张 · ` + tag.prompt.slice(0, 24)});
-      if (!valid()) return;
+      if (!currentMessage('generated')) return;
       jobs.set(key, {state: 'generating', saving: true});
       scheduleRender();
-      const url = await upload(result.blob, ctx.name2 || 'ST-iPhonie', valid);
+      const url = await upload(result.blob, folder, () => !!currentMessage('upload'));
       if (!url) return;
       await saveInOrder(async () => {
-        if (!valid()) { await removeFile(url); return; }
-        const list = versionsOf(stored(message, tag.hash));
+        const destination = currentMessage('save');
+        if (!destination) { await removeFile(url); return; }
+        const list = versionsOf(stored(destination, tag.hash));
         list.push({url, photoId: result.photoId, seed: result.seed, width: result.params.width, height: result.params.height, model: result.params.model, steps: result.params.steps, prompt: tag.prompt, characters: inputs.names, at: Date.now()});
-        keep(message, tag.hash, list, list.length - 1);
-        await ctx.saveChat();
-        if (valid() && settings().general.hideStoryWaves) redrawMessage(id, message);
+        keep(destination, tag.hash, list, list.length - 1);
+        await context().saveChat();
+        const rendered = currentMessage('saved');
+        if (rendered && settings().general.hideStoryWaves) redrawMessage(id, rendered);
       });
     } catch (error) {
       if (!error.cancelled && valid()) { jobs.set(key, {state: 'error', message: error.message}); if (settings().general.hideStoryWaves) notice(error.message); }
@@ -320,12 +336,12 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
   }
 
   /**
-   * Called after a new reply is rendered. 'separate' mode plans its pictures first; then new characters' looks are
+   * Called after a complete reply is received. 'separate' mode plans its pictures first; then new characters' looks are
    * saved and, when automatic drawing is on and free, all its pictures are queued.
    */
   async function autoPictures(id) {
-    const s = settings();
-    const message = context().chat[id];
+    const s = settings(), ctx = context(), target = captureStoryPictureTarget(ctx, id), folder = ctx.name2 || 'ST-iPhonie';
+    let message = target.message;
     if (!message || message.is_user || message.is_system) return;
     const wantVoice = !!voice?.wanted() && !voice.has(message.mes);
     const wantPictures = s.draw.enabled && s.draw.mode === 'separate' && !parsePictures(message.mes).length;
@@ -333,7 +349,8 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
       let done;
       try { done = await planReply(id, {voiced: wantVoice, pictured: wantPictures, phoned: true}); } catch (error) { notice(error.message); return; }
       if (wantPictures && !done.pictured) return;
-      if (context().chat[id] !== message) return;
+      message = resolveStoryPictureTarget(context(), target).message;
+      if (!message) return;
     }
     if (!s.draw.enabled) return;
     registerAppearances(message);
@@ -342,7 +359,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     if (!tags.length) return;
     const permission = await allowed(false);
     if (!permission) { backend.reportDiagnostic?.('正文出图', {message:'自动出图未执行，当前设置无法确认免费额度',engine:s.draw.engine,relay:!!s.draw.relay.url}, 'warn');scheduleRender(); return; }
-    await Promise.all(tags.map(tag => generate(id, tag, {message, permission})));
+    await Promise.all(tags.map(tag => generate(id, tag, {target, permission, folder})));
   }
 
   /** What the queue says about a job, for the placeholder. */
@@ -674,18 +691,20 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
   }
 
   async function drawMessage(id) {
-    const message = context().chat[id];
+    const ctx = context(), target = captureStoryPictureTarget(ctx, id), folder = ctx.name2 || 'ST-iPhonie';
+    let message = target.message;
     if (!storyReply(message)) throw Error('找不到这层楼的回复');
     if (!backend.drawReady()) throw Error('请先在小手机的绘图 App 配好绘图接口');
     if (!parsePictures(message.mes).length && !await planPictures(id)) return;
-    if (context().chat[id] !== message) return;
+    message = resolveStoryPictureTarget(context(), target).message;
+    if (!message) return;
     const tags = parsePictures(message.mes).filter(tag => !shown(message, tag.hash));
     if (!tags.length) { notice('这层楼的图片已经生成'); return; }
     const permission = await allowed(true, undefined, '', tags.length);
-    if (!permission || context().chat[id] !== message) return;
-    const draw = settings().draw, make = tag => generate(id, tag, {message, permission});
+    if (!permission) return;
+    const draw = settings().draw, make = tag => generate(id, tag, {target, permission, folder});
     if (drawQueueChannel(draw.engine, draw.comfy.url) !== 'serial') await Promise.all(tags.map(make));
-    else for (const tag of tags) { if (context().chat[id] !== message) break; await make(tag); }
+    else for (const tag of tags) { if (!resolveStoryPictureTarget(context(), target).message) break; await make(tag); }
   }
   return {drawFor, tagText, drawMessage, decorate, click, autoPictures, planPictures, planLatest, voiceLatest, registerAppearances, recentMessages, insertImage, suggestPrompt, writePrompt, subscriptionLabel, pictureStats, clearPictures};
 }
