@@ -76,11 +76,14 @@ export async function runningHubGenerate({fetch = globalThis.fetch, key, workflo
   let taskId = '', complete = false;
   try {
     // Never retry task creation automatically: the first request may already have been accepted.
-    const submitted = await api('/task/openapi/create',{workflowId:route.workflowId,instanceType:'default',nodeInfoList:fields});
+    signal?.throwIfAborted();
+    // Once sent, let create return its ID even if cancelled locally. finally can then cancel that exact cloud task.
+    const submitted = await api('/task/openapi/create',{workflowId:route.workflowId,instanceType:'default',nodeInfoList:fields}, null);
     if (submitted.code !== 0) throw Error(`RunningHub 提交失败（${submitted.code}）：${String(submitted.msg || '').slice(0,160)}`);
     taskId = String(submitted.data?.taskId || '');
     if (!taskId) throw Error('RunningHub 未返回任务编号，请先检查云端任务列表再重试');
     onTask(taskId);
+    signal?.throwIfAborted();
     const tips = typeof submitted.data.promptTips === 'string' ? JSON.parse(submitted.data.promptTips || '{}') : submitted.data.promptTips;
     if (tips?.result === false || Object.keys(tips?.node_errors || {}).length) throw Error('RunningHub 云工作流校验失败，请检查节点配置');
     const deadline = Date.now()+timeoutMs;

@@ -1,10 +1,11 @@
-// NovelAI request queue. One account allows one image at a time; when friends share an account, requests that
+// The serial lane keeps the original NovelAI rules. One account allows one image at a time; when friends share an account, requests that
 // collide get 429 and too many of them can get the account flagged. So:
 //   - requests from this browser run one at a time, also across tavern tabs (Web Locks when available);
 //   - two requests are at least `gap` apart (the last request time is shared through localStorage);
 //   - a 429 ("account busy") waits and retries with growing pauses, up to `retries` times, instead of failing.
 //   - with a shared cloud queue (remote), each request also waits for its turn among everyone using the account;
 //     when the cloud cannot be reached the job goes ahead with the local rules and remoteError says why.
+// GPT and RunningHub each have their own bounded lane. Each image keeps its own request and abort signal.
 // Job states: waiting (in line) · spacing (keeping the gap) · remote (waiting in the cloud queue) · busy (429, waiting to retry) · running.
 
 const LAST_KEY = 'sttts.nai.lastRequest';
@@ -22,8 +23,9 @@ function memoryStorage() {
 function pause(ms, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(cancelled()); return; }
-    const timer = setTimeout(resolve, Math.max(0, ms));
-    signal?.addEventListener('abort', () => { clearTimeout(timer); reject(cancelled()); }, {once: true});
+    const abort = () => { clearTimeout(timer); reject(cancelled()); };
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, Math.max(0, ms));
+    signal?.addEventListener('abort', abort, {once: true});
   });
 }
 
@@ -31,20 +33,21 @@ export class DrawQueue {
   /**
    * gap(): milliseconds between two requests. retries(): how often a 429 is retried.
    * onChange(list, {remoteError}): called whenever the line changes. backoff(attempt): pause before retry `attempt` (1-based).
-   * remote(): the shared cloud queue to wait in, or null.
+   * remote(): the shared cloud queue to wait in, or null. concurrency(channel): local GPT or RunningHub slots, 1–4.
    */
-  constructor({gap = () => 3000, retries = () => 4, onChange = () => {}, remote = () => null, locks = globalThis.navigator?.locks, storage = memoryStorage(), now = Date.now, wait = pause,
+  constructor({gap = () => 3000, retries = () => 4, onChange = () => {}, remote = () => null, concurrency = () => 2, locks = globalThis.navigator?.locks, storage = memoryStorage(), now = Date.now, wait = pause,
     backoff = attempt => Math.min(120000, 15000 * 2 ** (attempt - 1)) + Math.random() * 3000} = {}) {
-    Object.assign(this, {gap, retries, onChange, remote, locks, storage, now, wait, backoff});
+    Object.assign(this, {gap, retries, onChange, remote, concurrency, locks, storage, now, wait, backoff});
     this.jobs = [];
     this.remoteError = '';
-    this.running = false;
+    this.active = {serial: 0, gpt: 0, runninghub: 0};
   }
   /** Adds a job; the same key joins the job already in line. task(signal) makes the request. */
-  add({key = crypto.randomUUID(), label = '', task}) {
+  add({key = crypto.randomUUID(), label = '', channel = 'serial', task}) {
     const existing = this.jobs.find(j => j.key === key);
     if (existing) return existing.promise;
-    const job = {key, label, task, state: 'waiting', attempt: 0, until: 0, controller: new AbortController()};
+    if (channel !== 'gpt' && channel !== 'runninghub') channel = 'serial';
+    const job = {key, label, task, channel, active: false, state: 'waiting', attempt: 0, until: 0, controller: new AbortController()};
     job.promise = new Promise((resolve, reject) => { job.resolve = resolve; job.reject = reject; });
     this.jobs.push(job);
     this.changed();
@@ -52,17 +55,19 @@ export class DrawQueue {
     return job.promise;
   }
   list() {
-    return this.jobs.map(({key, label, state, attempt, until, cloud}, position) => ({key, label, state, attempt, until, position, cloud: cloud || null}));
+    const positions = {serial: 0, gpt: 0, runninghub: 0};
+    return this.jobs.map(({key, label, channel, state, attempt, until, cloud}) =>
+      ({key, label, channel, state, attempt, until, position: positions[channel]++, cloud: cloud || null}));
   }
   get(key) { return this.list().find(j => j.key === key) || null; }
-  get pending() { return this.jobs.some(job => !job.settled); }
+  get pending() { return this.jobs.length > 0; }
   cancel(key) {
     const index = this.jobs.findIndex(j => j.key === key);
     if (index < 0) return false;
     const job = this.jobs[index];
     job.controller.abort();
-    // The head job is stopped by its own run(); later jobs leave the line right away.
-    if (index > 0 || !this.running) { this.jobs.splice(index, 1); job.reject(cancelled()); this.changed(); }
+    // Keep an active slot until its task, including any cloud cancellation, finishes.
+    if (!job.active) { this.jobs.splice(index, 1); job.reject(cancelled()); this.changed(); }
     return true;
   }
   cancelAll() { for (const job of [...this.jobs].reverse()) this.cancel(job.key); }
@@ -84,52 +89,64 @@ export class DrawQueue {
     }
   }
 
-  async pump() {
-    if (this.running) return;
-    this.running = true;
+  /** Also called when a limit changes. Lowering a limit lets active jobs finish. */
+  pump() {
+    for (const job of this.jobs) {
+      if (job.active) continue;
+      const configured = job.channel === 'serial' ? 1 : Number(this.concurrency(job.channel));
+      const limit = Number.isFinite(configured) ? Math.max(1, Math.min(4, Math.trunc(configured))) : 2;
+      if (this.active[job.channel] >= limit) continue;
+      job.active = true;
+      this.active[job.channel]++;
+      void this.execute(job);
+    }
+  }
+  async execute(job) {
     try {
-      while (this.jobs.length) {
-        const job = this.jobs[0];
-        const run = () => this.run(job);
-        await (this.locks?.request ? this.locks.request('st-iphonie-novelai', run) : run());
-        const index = this.jobs.indexOf(job);
-        if (index >= 0) this.jobs.splice(index, 1);
-        this.changed();
-      }
-    } finally { this.running = false; }
+      const run = () => this.run(job);
+      const result = job.channel === 'serial' && this.locks?.request
+        ? await this.locks.request('st-iphonie-novelai', {signal: job.controller.signal}, run)
+        : await run();
+      job.resolve(result);
+    } catch (error) {
+      job.reject(job.controller.signal.aborted ? cancelled() : error);
+    } finally {
+      this.jobs.splice(this.jobs.indexOf(job), 1);
+      this.active[job.channel]--;
+      this.changed();
+      this.pump();
+    }
   }
   async run(job) {
-    const signal = job.controller.signal;
-    try {
-      for (let attempt = 0; ; attempt++) {
+    const signal = job.controller.signal, serial = job.channel === 'serial';
+    for (let attempt = 0; ; attempt++) {
+      signal.throwIfAborted();
+      if (serial) {
         const readyAt = this.storage.get() + this.gap();
         if (readyAt > this.now()) {
           job.state = 'spacing'; job.until = readyAt; this.changed();
           await this.wait(readyAt - this.now(), signal);
         }
-        const lease = await this.turn(job, signal);
-        job.state = 'running'; job.attempt = attempt; job.until = 0; job.cloud = null; this.changed();
-        try {
-          const result = await job.task(signal);
-          this.storage.set(this.now());
-          lease?.release('done');
-          job.settled = true;
-          job.resolve(result);
-          return;
-        } catch (error) {
-          this.storage.set(this.now());
-          const delay = error?.status === 429 ? this.backoff(attempt + 1) : 0;
-          // A 429 makes everyone in the cloud queue wait as well.
-          lease?.release(delay ? 'busy' : 'done', delay);
-          if (signal.aborted) throw cancelled();
-          if (error?.status !== 429 || attempt >= this.retries()) throw error;
-          job.state = 'busy'; job.attempt = attempt + 1; job.until = this.now() + delay; this.changed();
-          await this.wait(delay, signal);
-        }
       }
-    } catch (error) {
-      job.settled = true;
-      job.reject(signal.aborted ? cancelled() : error);
+      const lease = serial ? await this.turn(job, signal) : null;
+      job.state = 'running'; job.attempt = attempt; job.until = 0; job.cloud = null; this.changed();
+      try {
+        signal.throwIfAborted();
+        const result = await job.task(signal);
+        // The task may already have saved its picture if cancellation arrived during the write.
+        if (serial) this.storage.set(this.now());
+        lease?.release('done');
+        return result;
+      } catch (error) {
+        if (serial) this.storage.set(this.now());
+        // RunningHub may already have created a billable task. Never repeat its submission.
+        const rateLimited = job.channel !== 'runninghub' && error?.status === 429;
+        const delay = rateLimited ? this.backoff(attempt + 1) : 0;
+        lease?.release(rateLimited ? 'busy' : 'done', delay);
+        if (signal.aborted || !rateLimited || attempt >= this.retries()) throw error;
+        job.state = 'busy'; job.attempt = attempt + 1; job.until = this.now() + delay; this.changed();
+        await this.wait(delay, signal);
+      }
     }
   }
 }

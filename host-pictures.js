@@ -20,6 +20,7 @@ import {worldInfoFor, loreOptions} from './host-lore.js';
 import {voicePlanRequest, combinedRequest, insertVoiced} from './core/voice-plan.js';
 import {withPhone, phoneSection} from './core/chat.js';
 import {TIER_NAMES, NAI_MODEL_NAMES} from './core/novelai.js';
+import {drawQueueChannel, DRAW_ENGINE_NAMES} from './core/image-engines.js';
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const versionsOf = record => !record ? [] : Array.isArray(record.versions) ? record.versions : record.url ? [{...record}] : [];
@@ -53,8 +54,16 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     message.extra.sttts_pics ??= {};
     message.extra.sttts_pics[hash] = list.length ? {versions: list, index: Math.min(list.length - 1, Math.max(0, index))} : {removed: true, versions: [], at: Date.now()};
   }
-  const jobKey = (id, tag) => `pic:${context()?.chatId ?? ''}:${id}:${tag.hash}`;
+  const chatId = ctx => ctx?.getCurrentChatId?.() ?? ctx?.chatId ?? '';
+  const jobKey = (id, tag) => `pic:${chatId(context())}:${id}:${tag.hash}`;
   const saveSoon = () => (context().saveChatDebounced || context().saveChat)?.();
+  // Saving a floor writes the entire chat. Keep those writes ordered even when pictures finish together.
+  let pictureSave = Promise.resolve();
+  function saveInOrder(change) {
+    const write = pictureSave.then(change);
+    pictureSave = write.catch(() => {});
+    return write;
+  }
 
   // The queue changes often (positions, retry countdowns): redraw the placeholders when it does.
   backend.subscribe?.(event => { if (event.type === 'draw' && event.queue) scheduleRender(); });
@@ -85,12 +94,13 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     if (was) hearts.delete(id); else hearts.add(id);
   }
 
-  async function upload(blob, name, folder = context().name2 || 'ST-iPhonie') {
+  async function upload(blob, folder, valid = () => true) {
     const ctx = context();
     const base64 = await backend.base64(blob);
+    if (!valid()) return '';
     const response = await fetch('/api/images/upload', {
       method: 'POST', headers: ctx.getRequestHeaders(),
-      body: JSON.stringify({image: base64, format: 'png', ch_name: folder, filename: String(name).replace(/\./g, '_')})
+      body: JSON.stringify({image: base64, format: 'png', ch_name: folder, filename: 'st-iphonie-' + crypto.randomUUID()})
     });
     if (!response.ok) throw Error('图片已生成，但上传到酒馆失败（' + response.status + '）');
     return tavernPicture((await response.json()).path);
@@ -103,7 +113,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
   }
 
   /** Asks before spending Anlas (or paying for a GPT picture). Returns 'free', 'paid' or false (declined, or no key). params: the picture's, when they are its own; who: the other plugin asking. */
-  async function allowed(interactive, params, who = '') {
+  async function allowed(interactive, params, who = '', count = 1) {
     if (!backend.drawReady()) { if (interactive) notice(backend.drawMissing() + '，请在小手机的引擎卡包里填写'); return false; }
     const engine = settings().draw.engine;
     // Through a relay counted as Opus, a subscription it does not pass on is expected, not worth a notice.
@@ -112,7 +122,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     if (quote.free === true) return 'free';
     if (!interactive) return false;
     const why = (who ? `「${who}」想用小手机画一张图。\n` : '') + (engine === 'gpt' ? 'GPT 生图每张都要花钱（按 OpenAI 或中转的价格）。' : quote.free === null ? '暂时读不到 NovelAI 订阅信息，无法确认是否免费。' : '按当前参数和订阅，这张图会扣 Anlas。');
-    return globalThis.confirm(why + '\n确定要生成吗？') ? 'paid' : false;
+    return globalThis.confirm(why + (count > 1 ? `\n本次共 ${count} 张，确定要生成吗？` : '\n确定要生成吗？')) ? 'paid' : false;
   }
 
   /**
@@ -135,37 +145,46 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
       const unwanted = String(negative ?? '').trim();
       const result = await backend.generateImage({...inputs, ...(unwanted ? {negative: [inputs.negative, unwanted].filter(Boolean).join(', ')} : {}), allowPaid: permission === 'paid', name: '插件', key, label: `${who || '其他插件'} · ${words.slice(0, 24)}`});
       // The picture is in the album either way: no address is no reason to lose it.
-      const url = await upload(result.blob, 'st-iphonie-' + Date.now(), 'ST-iPhonie').catch(() => '');
+      const url = await upload(result.blob, 'ST-iPhonie').catch(() => '');
       return {url, blob: result.blob, photoId: result.photoId, seed: result.seed, width: result.params.width, height: result.params.height, model: result.params.model, engine: result.engine, prompt: result.prompt};
     } finally { signal?.removeEventListener('abort', stop); }
   }
 
   /** Queues one picture. Redrawing adds a version; the earlier versions stay. */
-  async function generate(id, tag, {interactive = false, permission = null} = {}) {
-    const ctx = context(), message = ctx.chat[id], key = jobKey(id, tag);
+  async function generate(id, tag, {interactive = false, permission = null, message = context().chat[id]} = {}) {
+    const ctx = context(), owner = chatId(ctx), swipe = message?.swipe_id, key = jobKey(id, tag);
     if (!message || jobs.get(key)?.state === 'generating') return;
+    const valid = () => {
+      const now = context();
+      return owner === chatId(now) && now?.chat[id] === message && message.swipe_id === swipe && parsePictures(message.mes).some(t => t.hash === tag.hash);
+    };
+    if (!valid()) return;
     permission ??= await allowed(interactive);
-    if (!permission) return;
+    if (!permission || !valid() || jobs.get(key)?.state === 'generating') return;
     jobs.set(key, {state: 'generating'});
     scheduleRender();
     try {
       const inputs = pictureInputs(settings(), tag, message.mes);
-      const result = await backend.generateImage({...inputs, allowPaid: permission === 'paid', name: 'chat', key, label: '正文图片 · ' + tag.prompt.slice(0, 24)});
-      const url = await upload(result.blob, 'st-iphonie-' + Date.now());
-      // Only store the picture when the same message is still there with this tag.
-      const now = context().chat[id];
-      if (now === message && parsePictures(now.mes).some(t => t.hash === tag.hash)) {
-        const list = versionsOf(stored(now, tag.hash));
+      const result = await backend.generateImage({...inputs, allowPaid: permission === 'paid', name: 'chat', key, valid, label: '正文图片 · ' + tag.prompt.slice(0, 24)});
+      if (!valid()) return;
+      jobs.set(key, {state: 'generating', saving: true});
+      scheduleRender();
+      const url = await upload(result.blob, ctx.name2 || 'ST-iPhonie', valid);
+      if (!url) return;
+      await saveInOrder(async () => {
+        if (!valid()) { await removeFile(url); return; }
+        const list = versionsOf(stored(message, tag.hash));
         list.push({url, photoId: result.photoId, seed: result.seed, width: result.params.width, height: result.params.height, model: result.params.model, steps: result.params.steps, prompt: tag.prompt, characters: inputs.names, at: Date.now()});
-        keep(now, tag.hash, list, list.length - 1);
-        await context().saveChat();
-        if (settings().general.hideStoryWaves) redrawMessage(id, now);
-      }
-      jobs.delete(key);
+        keep(message, tag.hash, list, list.length - 1);
+        await ctx.saveChat();
+        if (valid() && settings().general.hideStoryWaves) redrawMessage(id, message);
+      });
     } catch (error) {
-      if (error.cancelled) jobs.delete(key); else { jobs.set(key, {state: 'error', message: error.message}); if (settings().general.hideStoryWaves) notice(error.message); }
+      if (!error.cancelled && valid()) { jobs.set(key, {state: 'error', message: error.message}); if (settings().general.hideStoryWaves) notice(error.message); }
+    } finally {
+      if (jobs.get(key)?.state === 'generating') jobs.delete(key);
+      scheduleRender();
     }
-    scheduleRender();
   }
 
   const planning = new Set();
@@ -304,7 +323,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
    */
   async function autoPictures(id) {
     const s = settings();
-    let message = context().chat[id];
+    const message = context().chat[id];
     if (!message || message.is_user || message.is_system) return;
     const wantVoice = !!voice?.wanted() && !voice.has(message.mes);
     const wantPictures = s.draw.enabled && s.draw.mode === 'separate' && !parsePictures(message.mes).length;
@@ -312,7 +331,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
       let done;
       try { done = await planReply(id, {voiced: wantVoice, pictured: wantPictures, phoned: true}); } catch (error) { notice(error.message); return; }
       if (wantPictures && !done.pictured) return;
-      message = context().chat[id];
+      if (context().chat[id] !== message) return;
     }
     if (!s.draw.enabled) return;
     registerAppearances(message);
@@ -321,22 +340,23 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     if (!tags.length) return;
     const permission = await allowed(false);
     if (!permission) { backend.reportDiagnostic?.('正文出图', {message:'自动出图未执行，当前设置无法确认免费额度',engine:s.draw.engine,relay:!!s.draw.relay.url}, 'warn');scheduleRender(); return; }
-    await Promise.all(tags.map(tag => generate(id, tag, {permission})));
+    await Promise.all(tags.map(tag => generate(id, tag, {message, permission})));
   }
 
   /** What the queue says about a job, for the placeholder. */
   function queueText(key) {
     const job = backend.drawQueue?.get?.(key);
-    if (!job) return 'NovelAI 正在画……';
-    if (job.state === 'running') return job.attempt ? `NovelAI 正在画……（第 ${job.attempt + 1} 次尝试）` : 'NovelAI 正在画……';
-    if (job.state === 'busy') return `NovelAI 账号正忙，稍后自动重试（第 ${job.attempt} 次）`;
+    if (!job) return '正在处理图片……';
+    const service = job.channel === 'runninghub' ? 'RunningHub' : DRAW_ENGINE_NAMES[settings().draw.engine];
+    if (job.state === 'running') return job.attempt ? `${service} 正在画……（第 ${job.attempt + 1} 次尝试）` : `${service} 正在画……`;
+    if (job.state === 'busy') return `${service} 正忙，稍后自动重试（第 ${job.attempt} 次）`;
     if (job.state === 'spacing') return '排队中，马上开始';
     if (job.state === 'remote') {
       const c = job.cloud || {};
       if (c.position > 0) return `云端排队中，前面还有 ${c.position} 位${c.holder ? `（${c.holder} 正在画）` : ''}`;
       return c.cooldown > 5000 ? `账号刚才忙，大家一起等 ${Math.ceil(c.cooldown / 1000)} 秒` : '云端排队，马上轮到你';
     }
-    return `排队中，前面还有 ${job.position} 张`;
+    return `排队中（队列第 ${job.position + 1} 张）`;
   }
 
   function frame(inner) { return `<span class="sttts-pic-frame">${inner}</span>`; }
@@ -344,7 +364,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     const record = stored(message, tag.hash), pic = shown(message, tag.hash), key = jobKey(id, tag), job = jobs.get(key);
     const s = settings(), folded = folds.get(id + ':' + tag.hash) ?? s.draw.fold;
     const state = job?.state || (pic ? 'done' : record?.removed ? 'removed' : 'idle');
-    const waiting = state === 'generating' ? queueText(key) : '';
+    const waiting = job?.saving ? '正在保存图片……' : state === 'generating' ? queueText(key) : '';
     const signature = [state, pic?.url, pic?.count, folded, waiting, job?.message].join('|');
     if (el.dataset.stttsRendered === signature) return;
     el.dataset.stttsRendered = signature;
@@ -358,9 +378,10 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
       el.innerHTML = `<span class="sttts-pic-removed">图片已删除<button type="button" data-sttts-pic-action="draw">重新生成</button></span>`;
     } else if (state === 'generating') {
       // Redrawing keeps the current picture on screen with a small note over it.
+      const cancel = job.saving ? '' : '<button type="button" data-sttts-pic-action="cancel">取消</button>';
       el.innerHTML = pic
-        ? frame(`<button type="button" class="sttts-pic-zoom" data-sttts-pic-action="tap" aria-label="点一下收起，双击放大查看"><img src="${esc(pic.url)}" alt="${esc(tag.prompt)}" loading="lazy"></button><span class="sttts-pic-note">${esc(waiting)}<button type="button" data-sttts-pic-action="cancel">取消</button></span>`)
-        : frame(`<span class="sttts-pic-wait">${esc(waiting)}<br><button type="button" data-sttts-pic-action="cancel">取消</button></span>`);
+        ? frame(`<button type="button" class="sttts-pic-zoom" data-sttts-pic-action="tap" aria-label="点一下收起，双击放大查看"><img src="${esc(pic.url)}" alt="${esc(tag.prompt)}" loading="lazy"></button><span class="sttts-pic-note">${esc(waiting)}${cancel}</span>`)
+        : frame(`<span class="sttts-pic-wait">${esc(waiting)}${cancel ? '<br>' + cancel : ''}</span>`);
     } else if (state === 'error') {
       el.innerHTML = frame(`<span class="sttts-pic-wait">${esc(job.message)}<br><button type="button" data-sttts-pic-action="draw">重试</button></span>`);
     } else {
@@ -427,7 +448,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
   }
   function act(action, id, message, tag, source = null) {
     const pic = shown(message, tag.hash);
-    if (action === 'draw' || action === 'redo') generate(id, tag, {interactive: true});
+    if (action === 'draw' || action === 'redo') generate(id, tag, {interactive: true, message});
     if (action === 'cancel') backend.drawQueue?.cancel?.(jobKey(id, tag));
     if (action === 'open') openDraw({...pictureInputs(settings(), tag, message.mes), tag: tag.prompt, seed: pic?.seed});
     if (action === 'fold' || action === 'unfold') { folds.set(id + ':' + tag.hash, action === 'fold'); scheduleRender(); }
@@ -504,7 +525,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
       redrawMessage(id, message);
       scheduleRender();
     }
-    generate(id, fresh, {interactive: true});
+    generate(id, fresh, {interactive: true, message});
     return true;
   }
   async function remove(id, tag) {
@@ -552,19 +573,23 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     return rows;
   }
   async function insertImage(id, photoId) {
-    const ctx = context(), message = ctx.chat[id];
+    const ctx = context(), message = ctx.chat[id], folder = ctx.name2 || 'ST-iPhonie';
     if (!message) throw Error('这条消息已经不存在');
+    const valid = () => context()?.chat[id] === message;
     const photo = await backend.library.getPhoto(photoId);
     if (!photo) throw Error('图片已不在相册中');
-    const url = await upload(photo.blob, 'st-iphonie-' + Date.now());
-    message.extra ??= {};
-    if (!Array.isArray(message.extra.media)) message.extra.media = [];
-    message.extra.inline_image = !(message.extra.media.length && !message.extra.inline_image);
-    message.extra.media.push({url, type: 'image', title: photo.name, source: 'generated'});
-    message.extra.media_index = message.extra.media.length - 1;
-    const element = globalThis.$?.(`#chat .mes[mesid="${id}"]`);
-    if (element?.length && ctx.appendMediaToMessage) ctx.appendMediaToMessage(message, element);
-    await ctx.saveChat();
+    const url = await upload(photo.blob, folder, valid);
+    await saveInOrder(async () => {
+      if (!valid() || !url) { await removeFile(url); throw Error('这条消息已经变了'); }
+      message.extra ??= {};
+      if (!Array.isArray(message.extra.media)) message.extra.media = [];
+      message.extra.inline_image = !(message.extra.media.length && !message.extra.inline_image);
+      message.extra.media.push({url, type: 'image', title: photo.name, source: 'generated'});
+      message.extra.media_index = message.extra.media.length - 1;
+      const element = globalThis.$?.(`#chat .mes[mesid="${id}"]`);
+      if (element?.length && ctx.appendMediaToMessage) ctx.appendMediaToMessage(message, element);
+      await ctx.saveChat();
+    });
     return {id, url};
   }
   async function suggestPrompt() {
@@ -654,8 +679,11 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     if (context().chat[id] !== message) return;
     const tags = parsePictures(message.mes).filter(tag => !shown(message, tag.hash));
     if (!tags.length) { notice('这层楼的图片已经生成'); return; }
-    const permission = await allowed(true); if (!permission) return;
-    for (const tag of tags) { if (context().chat[id] !== message) break; await generate(id, tag, {permission}); }
+    const permission = await allowed(true, undefined, '', tags.length);
+    if (!permission || context().chat[id] !== message) return;
+    const draw = settings().draw, make = tag => generate(id, tag, {message, permission});
+    if (drawQueueChannel(draw.engine, draw.comfy.url) !== 'serial') await Promise.all(tags.map(make));
+    else for (const tag of tags) { if (context().chat[id] !== message) break; await make(tag); }
   }
   return {drawFor, tagText, drawMessage, decorate, click, autoPictures, planPictures, planLatest, voiceLatest, registerAppearances, recentMessages, insertImage, suggestPrompt, writePrompt, subscriptionLabel, pictureStats, clearPictures};
 }

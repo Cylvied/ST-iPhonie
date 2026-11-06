@@ -9,9 +9,16 @@
 import {proxyAddress, noTavernProxy} from './proxy-url.js';
 
 import {normalizeDisabledLoras} from './comfy-loras.js';
+import {isRunningHub} from './runninghub.js';
 
 export const DRAW_ENGINES = ['nai', 'gpt', 'comfy'];
 export const DRAW_ENGINE_NAMES = {nai: 'NovelAI', gpt: 'GPT 生图', comfy: 'ComfyUI'};
+
+export function drawQueueChannel(engine, comfyUrl) {
+  if (engine === 'gpt') return 'gpt';
+  if (engine === 'comfy' && isRunningHub(comfyUrl)) return 'runninghub';
+  return 'serial';
+}
 
 // ---------- GPT ----------
 export const OPENAI_BASE = 'https://api.openai.com/v1';

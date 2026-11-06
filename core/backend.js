@@ -29,7 +29,7 @@ import { DRAWN_SOURCES, FAVORITES, ALBUM_LIMITS, albumName, albumsInOrder } from
 import { paintStore } from './paint-store.js';
 import { Ledger } from './ledger.js';
 import { WALLET_LIMITS, PREMIUM, DECOR_KINDS, LEDGER_KINDS, premiumOf, decorKey, cents, yuan, shopGifts, normalizeGift, validateGift } from './wallet.js';
-import { gptModels, DRAW_ENGINES, DRAW_ENGINE_NAMES, GPT_IMAGE_MODELS, GPT_QUALITIES, GPT_MAX_REFS, gptBase, gptSize, gptPrompt, gptGenerate, comfyUrl, comfySize, comfyPrompt, comfyValues, fillWorkflow, comfyGenerate, comfyCatalog, comfyLoras, comfyClips, comfyProgress, defaultWorkflow, tavernWorkflows, tavernWorkflow, orientationOf, DEFAULT_COMFY_WORKFLOW, COMFY_PARAM_KEYS } from './image-engines.js';
+import { gptModels, drawQueueChannel, DRAW_ENGINES, DRAW_ENGINE_NAMES, GPT_IMAGE_MODELS, GPT_QUALITIES, GPT_MAX_REFS, gptBase, gptSize, gptPrompt, gptGenerate, comfyUrl, comfySize, comfyPrompt, comfyValues, fillWorkflow, comfyGenerate, comfyCatalog, comfyLoras, comfyClips, comfyProgress, defaultWorkflow, tavernWorkflows, tavernWorkflow, orientationOf, DEFAULT_COMFY_WORKFLOW, COMFY_PARAM_KEYS } from './image-engines.js';
 import {activeLoraWorkflow} from './comfy-loras.js';
 import {keepOneOutput, switchNodesOff} from './comfy-graph.js';
 import { normalizeSettings, validateSettings, modelRules, freshState } from './state.js';
@@ -207,6 +207,7 @@ export class TTSBackend {
         this.syncTimer = 0;
         this.syncApplying = false;
         this.drawQueue = new DrawQueue({ gap: () => this.settings.draw.queue.gap * 1000, retries: () => this.settings.draw.queue.retries,
+            concurrency: channel => this.settings.draw.queue[channel === 'gpt' ? 'gptConcurrency' : 'runninghubConcurrency'],
             remote: () => this.settings.draw.engine === 'nai' ? this.cloudQueue() : null, onChange: (queue, { remoteError }) => this.emit('draw', { queue, cloud: remoteError }) });
         this.listeners = new Set();
         this.revision = 0;
@@ -442,11 +443,13 @@ export class TTSBackend {
         const imageChanged = JSON.stringify([copy.draw.connections, copy.draw.engine]) !== JSON.stringify([this.settings.draw.connections, this.settings.draw.engine]);
         if (imageChanged) this.assertImageIdle();
         // The host callback completes before the service acknowledges a new settings revision.
+        const previousQueue = this.settings.draw.queue;
         this.persist(clone(copy));
         this.settings = copy;
         if (imageChanged) this.activateImageKeys();
         this.revision++;
         this.emit('settings', { state: this.getState() });
+        if (copy.draw.queue.gptConcurrency !== previousQueue.gptConcurrency || copy.draw.queue.runninghubConcurrency !== previousQueue.runninghubConcurrency) this.drawQueue.pump();
         return this.getState();
     }
     /** 整篇朗读: on or off, the 旁白's voice (系统朗读 or the 旁白 role), the system voice and speed, the tags not read. */
@@ -1540,12 +1543,13 @@ export class TTSBackend {
     async comfyWorkflows() { this.assertOpen(); return tavernWorkflows({ fetch: this.imageFetch, headers: this.tavernHeaders() }); }
     async comfyWorkflow(name) { this.assertOpen(); return tavernWorkflow({ fetch: this.imageFetch, headers: this.tavernHeaders(), name: String(name || '') }); }
     /** Draws with GPT or ComfyUI. Inputs are the NovelAI-shaped picture (scene prompt, one caption per person). */
-    async drawWithEngine(engine, { prompt, negative, characters, quote, signal, comfy, refs = [], roles = false }) {
+    async drawWithEngine(engine, { prompt, negative, characters, quote, signal, comfy, gpt = this.settings.draw.gpt, key, checkRequest, refs = [], roles = false }) {
         const draw = this.settings.draw, p = quote.params;
         if (engine === 'gpt') {
             const paint = async list => {
+                checkRequest?.();
                 const text = gptPrompt({ prompt, characters: list.length ? characters : characters.map(({ image, ...c }) => c), refs: list });
-                return { text, blob: await gptGenerate({ fetch: this.imageFetch, settings: draw.gpt, key: this.gptKey, prompt: text, size: `${p.width}x${p.height}`, refs: list, signal }) };
+                return { text, blob: await gptGenerate({ fetch: this.imageFetch, settings: gpt, key: this.gptKey, prompt: text, size: `${p.width}x${p.height}`, refs: list, signal }) };
             };
             let made, sent = refs;
             try { made = await paint(refs); }
@@ -1554,18 +1558,19 @@ export class TTSBackend {
                 // page is open), not the picture. That answer drew nothing, so nothing is paid twice.
                 const missing = [404, 405, 501].includes(error?.status) || error?.status === 400 && /not (supported|implemented)|unsupported|invalid url|no route|不支持/i.test(error.message);
                 if (!roles || !refs.length || !missing) throw error;
-                (this.gptNoEdits ??= new Set()).add((draw.gpt.url || '') + '|' + draw.gpt.model);
+                (this.gptNoEdits ??= new Set()).add((gpt.url || '') + '|' + gpt.model);
                 sent = [];
                 made = await paint(sent);
             }
-            return { blob: made.blob, seed: -1, params: { model: draw.gpt.model, width: p.width, height: p.height }, prompt: made.text, refs: sent.length, ...(roles ? { faces: sent.map(r => r.label).filter(Boolean), dropped: !sent.length } : {}) };
+            return { blob: made.blob, seed: -1, params: { model: gpt.model, width: p.width, height: p.height }, prompt: made.text, refs: sent.length, ...(roles ? { faces: sent.map(r => r.label).filter(Boolean), dropped: !sent.length } : {}) };
         }
         const c = comfy || draw.comfy, seed = p.seed >= 0 ? p.seed : Math.floor(Math.random() * 4294967295);
         const text = comfyPrompt({ prompt, negative, characters });
         const graph = keepOneOutput(switchNodesOff(activeLoraWorkflow(c.workflow || defaultWorkflow(c), c.disabledLoras), c.disabledNodes || []), c.output || '');
         const workflow = fillWorkflow(graph, { ...comfyValues(c, { prompt: text.prompt, negative: text.negative, width: p.width, height: p.height, seed }), ...await this.comfyTavernValues(graph) });
+        checkRequest?.();
         if (isRunningHub(c.url)) {
-            const result = await runningHubGenerate({fetch: this.imageFetch, key: this.keyStore.load().get('runninghub'), workflow, signal, onTask: taskId => this.emit('draw', {runninghubTaskId: taskId})});
+            const result = await runningHubGenerate({fetch: this.imageFetch, key: this.keyStore.load().get('runninghub'), workflow, signal, onTask: taskId => this.emit('draw', {key, runninghubTaskId: taskId})});
             return {blob: result.blob, seed, params: {model: result.model, width: p.width, height: p.height, steps: c.steps, scale: c.scale, sampler: c.sampler, runninghubTaskId: result.taskId, runninghubCoins: result.cost}, prompt: text.prompt};
         }
         const stopSteps = comfyProgress({ url: c.url, onStep: (value, max) => this.emit('draw', { steps: `${value}/${max} 步` }) });
@@ -1593,10 +1598,15 @@ export class TTSBackend {
         const p = this.settings.draw.params;
         return this.novelai.suggestTags({ model: p.model, prompt: word, mode: p.mode, signal });
     }
-    /** Generates one image and keeps it in the album. Requests wait in the NovelAI queue (see draw-queue.js).
+    /** Generates one image and keeps it in the album. Requests share their channel's queue (see draw-queue.js).
      *  key identifies the job in the queue (the same key joins the job already waiting); label is shown in the line. */
-    generateImage({ prompt, negative = '', characters = [], params, allowPaid = false, name = '', key, label = '', base = null, refs = [], roleRefs = [], preview = false } = {}) {
+    generateImage({ prompt, negative = '', characters = [], params, allowPaid = false, name = '', key = crypto.randomUUID(), label = '', base = null, refs = [], roleRefs = [], preview = false, valid } = {}) {
         this.assertOpen();
+        // A story job may wait for a slot while its chat is closed or its picture block is edited.
+        const checkRequest = () => {
+            this.assertOpen();
+            if (valid && !valid()) throw Object.assign(Error('这张图所在的楼层已经变了'), {cancelled: true});
+        };
         if (!String(prompt || '').trim()) return Promise.reject(Error('请先写提示词'));
         const engine = this.settings.draw.engine;
         if (!this.drawReady()) return Promise.reject(Error(this.drawMissing()));
@@ -1611,13 +1621,15 @@ export class TTSBackend {
             const c = this.settings.draw.comfy;
             const comfy = engine === 'comfy' ? clone(Object.fromEntries(['url', 'workflow', 'disabledLoras', 'disabledNodes', 'output', ...COMFY_PARAM_KEYS].map(k => [k, c[k]]))) : undefined;
             // 角色参考图 (pictureInputs: the people in it who have one) go to GPT when nothing was given by hand.
-            const picture = {prompt, negative, characters: clone(characters), quote, comfy, refs: gptRefs, roleRefs: engine === 'gpt' && !gptRefs.length && Array.isArray(roleRefs) ? clone(roleRefs) : []};
-            const job = this.drawQueue.add({ key, label: label || String(prompt).slice(0, 40), task: async signal => {
-                this.assertOpen();
+            const picture = {prompt, negative, characters: clone(characters), quote, comfy, gpt: engine === 'gpt' ? this.settings.draw.gpt : undefined, refs: gptRefs, roleRefs: engine === 'gpt' && !gptRefs.length && Array.isArray(roleRefs) ? clone(roleRefs) : []};
+            const channel = drawQueueChannel(engine, comfy?.url);
+            const job = this.drawQueue.add({ channel, key, label: label || String(prompt).slice(0, 40), task: async signal => {
+                checkRequest();
                 this.emit('draw', { phase: 'generating' });
                 const own = picture.roleRefs.length ? await this.roleReferences(picture.roleRefs, picture.characters) : null;
-                const made = await this.drawWithEngine(engine, { ...picture, ...(own ? { refs: own.refs, characters: own.characters, roles: true } : {}), signal });
+                const made = await this.drawWithEngine(engine, { ...picture, ...(own ? { refs: own.refs, characters: own.characters, roles: true } : {}), signal, key, checkRequest });
                 this.assertOpen();
+                signal.throwIfAborted();
                 const ext = made.blob.type === 'image/jpeg' ? 'jpg' : made.blob.type === 'image/webp' ? 'webp' : 'png';
                 const info = this.pictureInfo(engine, made, picture);
                 if (made.dropped) info.push(['参考图', '没带：中转不支持改图接口（/images/edits）']);
@@ -1639,12 +1651,15 @@ export class TTSBackend {
         // 边画边看: the drawing app asks for it, when it is switched on; a picture from the story just comes when it is done.
         const stream = preview && this.settings.draw.stream;
         const job = this.drawQueue.add({ key, label: label || String(prompt).slice(0, 40), task: async signal => {
-            this.assertOpen();
+            checkRequest();
             this.emit('draw', { phase: 'generating' });
             // References and 局部重绘 go without vibes, as in NovelAI's own app.
             if (quote.vibes.used.length && !request.refs && request.body.action !== 'infill') Object.assign(request.body.parameters, await this.vibeFields(quote.vibes.used, request.params.model, signal));
             this.novelai.relay = this.settings.draw.relay.url;
-            const send = () => stream ? this.novelai.generateStream(request.body, signal, frame => this.emit('draw', { steps: frame.steps > 1 ? `${Math.min(frame.step + 1, frame.steps)}/${frame.steps} 步` : '', preview: frame.image })) : this.novelai.generate(request.body, signal);
+            const send = () => {
+                checkRequest();
+                return stream ? this.novelai.generateStream(request.body, signal, frame => this.emit('draw', { steps: frame.steps > 1 ? `${Math.min(frame.step + 1, frame.steps)}/${frame.steps} 步` : '', preview: frame.image })) : this.novelai.generate(request.body, signal);
+            };
             let blob;
             try { blob = await send(); }
             catch (error) {

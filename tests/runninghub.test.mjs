@@ -35,6 +35,24 @@ test('abort cancels submitted task exactly once',async()=>{
  assert.equal(paths.filter(x=>x.includes('cancel')).length,1);
 });
 test('uncertain create is not retried',async()=>{let count=0;await assert.rejects(runningHubGenerate({key:'test',workflow,fetch:async()=>{count++;throw Error('network');}}));assert.equal(count,1);});
+test('cancelling during create waits for the task ID and cancels it without polling', async () => {
+ const controller = new AbortController(), calls = [];
+ let reply;
+ const job = runningHubGenerate({key: 'fixture', workflow, signal: controller.signal, fetch: (url, init) => {
+   calls.push(url);
+   if (url.endsWith('/create')) return new Promise((resolve, reject) => {
+     init.signal.addEventListener('abort', () => reject(init.signal.reason), {once: true});
+     reply = resolve;
+   });
+   assert.ok(url.endsWith('/cancel'));
+   assert.equal(JSON.parse(init.body).taskId, '123');
+   return json({code: 0});
+ }});
+ controller.abort();
+ reply(json(ok));
+ await assert.rejects(job, {name: 'AbortError'});
+ assert.equal(calls.length, 2);
+});
 test('validation rejection cancels and HTML output is rejected',async()=>{
  let cancelled=false;
  await assert.rejects(runningHubGenerate({key:'test',workflow,fetch:async(url)=>{if(url.includes('cancel')){cancelled=true;return json({code:0});}return json({code:0,data:{taskId:'123',promptTips:{result:false}}});}}),/校验/);

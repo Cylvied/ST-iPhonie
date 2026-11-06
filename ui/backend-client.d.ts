@@ -293,14 +293,15 @@ export interface VibeSummary { id: string; name: string; thumb: string; strength
 /** The vibes a picture would use: encode = how many need encoding first (2 Anlas each), over = left out by the free-tier guard. */
 export interface VibePlan { on: boolean; model: boolean; used: Array<{ id: string; name: string; strength: number; encode: boolean }>; skipped: Array<{ name: string; why: 'missing' | 'model' | 'no-encoding' }>; over: number; encode: number; extra: number; }
 export interface DrawSettingsPatch { chunks?: PromptChunk[]; stream?: boolean; autoDownload?: boolean; locks?: string[]; grid?: DrawGrid; positionGrid?: Partial<DrawPositionGrid>; maskLook?: Partial<DrawMaskLook>; enabled?: boolean; auto?: boolean; guard?: boolean; fold?: boolean; queue?: Partial<DrawQueueSettings>; params?: Partial<DrawParams>; activeStyle?: string; activePreset?: string; relay?: Partial<{ url: string; assumeOpus: boolean }>; vibe?: Partial<VibeSettings>; engine?: DrawEngine; gpt?: Partial<GptImageSettings>; comfy?: Partial<ComfySettings>; }
-/** gap: seconds between two NovelAI requests (0-60). retries: how often an "account busy" (429) is retried (0-10). */
-export interface DrawQueueSettings { gap: number; retries: number; cloud: CloudQueueSettings; }
+/** gap: seconds between two NovelAI requests (0-60). retries: 429 retries (0-10).
+ * Each concurrency setting limits simultaneous pictures for its own channel (1-4, default 2). */
+export interface DrawQueueSettings { gap: number; retries: number; gptConcurrency: number; runninghubConcurrency: number; cloud: CloudQueueSettings; }
 /** Shared queue service (cloud-queue/worker.js) that everyone using one NovelAI account joins with the same room code. */
 /** kind 'room': our own service (cloud-queue/), joined with a room code. kind 'keyhash': a service that groups people by the
  *  SHA-256 of their NovelAI key (the 智绘姬 / st-chatu8 queue protocol); no room code, only the hash is sent. */
 export interface CloudQueueSettings { enabled: boolean; kind: 'room' | 'keyhash'; url: string; room: string; }
-/** A NovelAI job: waiting in line, keeping the gap (spacing), waiting after a 429 (busy), or running. */
-export interface DrawJob { key: string; label: string; state: 'waiting' | 'spacing' | 'remote' | 'busy' | 'running'; attempt: number; until: number; position: number;
+/** One picture in the drawing queue. */
+export interface DrawJob { key: string; label: string; channel: 'serial' | 'gpt' | 'runninghub'; state: 'waiting' | 'spacing' | 'remote' | 'busy' | 'running'; attempt: number; until: number; position: number;
     /** While waiting in the cloud queue: people ahead, who is drawing, and the shared cooldown in ms. */
     cloud: { position: number; holder: string; cooldown: number } | null; }
 /** unlimited: an active Opus subscription (free small images). usage: the V5 allowance, when NovelAI reports it. */

@@ -353,7 +353,7 @@ export function normalizeMaskLook(value) {
 export function defaultDraw() {
   return {enabled: false, auto: true, guard: true, fold: false, mode: 'separate', strip: true, engine: 'nai', gpt: defaultGpt(), comfy: defaultComfy(),
     connections: {nai: normalizeImageConnections('nai'), gpt: normalizeImageConnections('gpt')},
-    queue: {gap: 3, retries: 4, cloud: {enabled: false, kind: 'room', url: '', room: ''}}, relay: {url: '', assumeOpus: false}, vibe: defaultVibe(), params: defaultDrawParams(),
+    queue: {gap: 3, retries: 4, gptConcurrency: 2, runninghubConcurrency: 2, cloud: {enabled: false, kind: 'room', url: '', room: ''}}, relay: {url: '', assumeOpus: false}, vibe: defaultVibe(), params: defaultDrawParams(),
     chunks: [], chunkGroups: [], stream: false, autoDownload: false, locks: [], grid: normalizeGrid(), positionGrid: normalizePositionGrid(), maskLook: normalizeMaskLook(), styles: [structuredClone(DEFAULT_STYLE)], styleGroups: [], activeStyle: 'default', presets: [structuredClone(DEFAULT_PRESET)], activePreset: 'default'};
 }
 
@@ -429,6 +429,8 @@ export function normalizeDraw(value) {
   const n = (v, min, max, fallback) => { const x = Math.round(Number(v)); return Number.isFinite(x) ? Math.min(max, Math.max(min, x)) : fallback; };
   const cloud = d.queue?.cloud || {};
   d.queue = {gap: n(d.queue?.gap, 0, 60, 3), retries: n(d.queue?.retries, 0, 10, 4),
+    gptConcurrency: n(d.queue?.gptConcurrency ?? base.queue.gptConcurrency, 1, 4, base.queue.gptConcurrency),
+    runninghubConcurrency: n(d.queue?.runninghubConcurrency ?? base.queue.runninghubConcurrency, 1, 4, base.queue.runninghubConcurrency),
     cloud: {enabled: !!cloud.enabled, kind: cloud.kind === 'keyhash' ? 'keyhash' : 'room', url: text(cloud.url, 300).trim().replace(/\/+$/, ''), room: text(cloud.room, 80).trim()}};
   const relay = d.relay && typeof d.relay === 'object' ? d.relay : {};
   d.relay = {url: (() => { try { return relayUrl(relay.url, ''); } catch { return ''; } })(), assumeOpus: !!relay.assumeOpus};

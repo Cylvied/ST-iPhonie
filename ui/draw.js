@@ -1,4 +1,5 @@
 import {isRunningHub, runningHubRoute, RUNNINGHUB_URL} from '../core/runninghub.js';
+import {drawQueueChannel} from '../core/image-engines.js';
 import {createView, esc, btn, field, input, select, textArea, toggle, heading, help, groupTitle, avatar, empty, pictureCopies} from './common.js';
 import {icon} from './icons.js';
 import {saveFile, shareFile, canShareFiles} from '../download.js';
@@ -42,10 +43,10 @@ const guideHTML = g => { const [across, down] = guideLines(g); return across.map
 
 export function drawApp(ctx) {
   const {api} = ctx, v = createView(ctx, 'draw'), urls = new Map();
-  let tab = 'prompt', idea = '', prompt = '', negative = '', characters = [], seed = -1, results = [], current = -1, newest = false, busy = false, subscription = null, epoch = 0;
+  let tab = 'prompt', idea = '', prompt = '', negative = '', characters = [], seed = -1, results = [], current = -1, newest = false, activeDraws = 0, submitting = false, subscription = null, epoch = 0;
   /** 随机提示词: while it is there it is drawn instead of what is written; what is written stays. */
   let randomText = '', randomChars = null;
-  /** How many pictures one 生成 makes (one request each, one after another). */
+  /** How many pictures one 生成 makes (one request per picture). */
   let count = 1;
   /** The tools for the shown picture: folded until asked for. */
   let toolsOpen = false;
@@ -61,7 +62,15 @@ export function drawApp(ctx) {
   let queue = api.drawQueue?.() || [], cloudError = api.cloudQueueError?.() || '', cloudNote = null;
   const jobState = j => j.state === 'running' ? '正在画' : j.state === 'busy' ? `账号正忙，稍后重试（第 ${j.attempt} 次）` : j.state === 'spacing' ? '马上开始'
     : j.state === 'remote' ? (j.cloud?.position > 0 ? `云端排队，前面 ${j.cloud.position} 位` : j.cloud?.cooldown > 5000 ? `大家一起等 ${Math.ceil(j.cloud.cooldown / 1000)} 秒` : '云端马上轮到') : `第 ${j.position + 1} 位`;
-  const queueCard = () => (queue.length || cloudError) ? `<div class="group pad queue-card"><div class="row-heading"><strong style="flex:1">排队 · ${queue.length} 张</strong>${queue.length ? btn('cancel-all', '全部取消', 'text-button') : ''}</div>${cloudError && state().queue.cloud.enabled ? `<p class="hint error-copy" style="padding:0 0 6px">${esc(cloudError)}，这次按本机排队</p>` : ''}${queue.map(j => `<div class="setting-row"><span>${esc(j.label || '图片')}</span><small>${esc(jobState(j))}</small>${j.state === 'running' ? '' : btn('cancel-job', icon('close'), 'text-button', `data-key="${esc(j.key)}" aria-label="取消这张"`)}</div>`).join('')}</div>` : '';
+  function queueCard() {
+    const d = state(), showError = cloudError && d.engine === 'nai' && d.queue.cloud.enabled;
+    if (!queue.length && !showError) return '';
+    const rows = queue.map(job => {
+      const cancel = job.state !== 'running' || job.channel === 'gpt' || job.channel === 'runninghub';
+      return `<div class="setting-row"><span>${esc(job.label || '图片')}</span><small>${esc(jobState(job))}</small>${cancel ? btn('cancel-job', icon('close'), 'text-button', `data-key="${esc(job.key)}" aria-label="取消这张"`) : ''}</div>`;
+    });
+    return `<div class="group pad queue-card"><div class="row-heading"><strong style="flex:1">排队 · ${queue.length} 张</strong>${queue.length ? btn('cancel-all', '全部取消', 'text-button') : ''}</div>${showError ? `<p class="hint error-copy" style="padding:0 0 6px">${esc(cloudError)}，这次按本机排队</p>` : ''}${rows.join('')}</div>`;
+  }
   const state = () => api.getState().draw;
   const eng = () => state().engine, engineName = (e = eng()) => api.drawCatalog.engineNames?.[e] || 'NovelAI';
   // Cloud queue fields as typed; saved when an input changes or a button uses them.
@@ -77,9 +86,9 @@ export function drawApp(ctx) {
   // 收藏: right there on what was just drawn.
   let hearts = new Set();
   function paintHearts() {
-    const b = v.root.querySelector('.canvas-heart'), on = hearts.has(results[current]?.photoId);
+    const b = v.root.querySelector('.canvas-heart'), on = hearts.has(b?.dataset.photoId);
     if (b) { b.setAttribute('aria-pressed', String(on)); b.setAttribute('aria-label', on ? '取消收藏' : '收藏'); b.querySelector('svg')?.setAttribute('fill', on ? 'currentColor' : 'none'); }
-    for (const t of v.root.querySelectorAll('.thumb[data-index]')) t.toggleAttribute('data-fav', hearts.has(results[Number(t.dataset.index)]?.photoId));
+    for (const t of v.root.querySelectorAll('.thumb[data-photo-id]')) t.toggleAttribute('data-fav', hearts.has(t.dataset.photoId));
   }
   const readHearts = () => api.favoritePhotoIds?.().then(ids => { hearts = new Set(ids); paintHearts(); }).catch(() => {});
   v.onAlbums = readHearts;
@@ -93,7 +102,8 @@ export function drawApp(ctx) {
   const urlFor = async id => {
     if (urls.has(id)) return urls.get(id);
     const photo = await api.getPhoto(id);
-    if (!photo) return '';
+    if (!photo || v.disposed) return '';
+    if (urls.has(id)) return urls.get(id);
     const url = ctx.win.URL.createObjectURL(photo.blob);
     urls.set(id, url);
     return url;
@@ -148,12 +158,12 @@ export function drawApp(ctx) {
         ${e === 'comfy' ? '' : `<details class="tool-fold char-pos" data-group="char-pos-${i}"><summary>位置<span class="chip">${placed}</span></summary><div class="char-pos-body">${free ? `<div class="pos-free" data-pos-pad data-index="${i}" style="aspect-ratio:${p.width}/${p.height}" role="group" aria-label="在画面里点一下放这个人">${guideHTML(d.positionGrid)}${others}</div>` : `<div class="pos-grid" aria-label="画面位置">${Array.from({length: 25}, (_, k) => `<button data-action="position" data-index="${i}" data-position="${k}" aria-pressed="${cell === k}" aria-label="位置 ${POSITION(k)}"></button>`).join('')}</div>`}<div class="pos-tools">${btn('position', '让模型自己决定位置', 'text-button', `data-index="${i}" data-position="-1" aria-pressed="${!at}"`)}</div></div></details>`}</div>`;
     }).join('') : empty('还没有加入角色', e === 'gpt' ? '每个角色的外貌和在画面里的位置，会写进给 GPT 的描述里。' : e === 'comfy' ? 'ComfyUI 没有分角色的提示词：每个人的外貌接在提示词后面，位置不起作用。' : 'V4 / 4.5 可以给每个角色单独写外貌，并指定在画面里的大致位置。', 'person'))
       + `<div class="token-meter" data-token-meter="positive" hidden></div><div class="actions">${btn('add-char', icon('add') + '从角色里添加', 'secondary')}${btn('add-custom', icon('add') + '手动添加', 'secondary')}</div>${free && characters.length ? `<div class="pos-tools pos-tools-all">${guideControl(d.positionGrid)}</div>` : ''}`;
-    if (tab === 'params' && e === 'gpt') body = gptParams(d.gpt);
+    if (tab === 'params' && e === 'gpt') body = gptParams(d.gpt) + concurrencyField('gptConcurrency', d.queue.gptConcurrency, 'GPT 按张计费。');
     // The lists are read as soon as the page is looked at; they can be typed in when ComfyUI does not answer.
-    if (tab === 'params' && e === 'comfy') { body = plans.summary(comfy) + runningHubParams(d.comfy) + comfyParams(d.comfy, comfy); if (!comfyInfo && !comfyReading) { comfyReading = true; readComfy().finally(() => { comfyReading = false; }); } }
+    if (tab === 'params' && e === 'comfy') { body = plans.summary(comfy) + runningHubParams(d.comfy) + (isRunningHub(d.comfy.url) ? concurrencyField('runninghubConcurrency', d.queue.runninghubConcurrency, 'RunningHub 按任务扣 RH 币。') : '') + comfyParams(d.comfy, comfy); if (!comfyInfo && !comfyReading) { comfyReading = true; readComfy().finally(() => { comfyReading = false; }); } }
     if (tab === 'params' && e === 'nai') body = naiParams(d, size) + grid.html() + locksHTML(d) + `
       <details data-group="draw-queue"><summary>排队<small class="fold-note">间隔 ${d.queue.gap} 秒 · ${d.queue.cloud.enabled ? '云端队列开着' : '本机排队'}</small></summary><div class="fold-body">
-      ${groupTitle('排队', help('一个 NovelAI 账号同一时间只能画一张。几个人共用账号时，同时请求会得到 429，太频繁还可能被风控。\n\n插件里所有出图都排成一队，一张画完再发下一张（同一个浏览器里开的几个酒馆页面也会互相等）；两张之间留出间隔；遇到 429 就等一会儿再试，等待时间一次比一次长。'))}
+      ${groupTitle('排队', help('一个 NovelAI 账号同一时间只能画一张。几个人共用账号时，同时请求会得到 429，太频繁还可能被风控。\n\n所有 NovelAI 出图都排成一队，一张画完再发下一张（同一个浏览器里开的几个酒馆页面也会互相等）；两张之间留出间隔；遇到 429 就等一会儿再试，等待时间一次比一次长。'))}
       <div class="group pad">
         <div class="field"><div class="meter-label"><span>两张图之间至少间隔</span><output>${d.queue.gap} 秒</output></div><input class="slider" type="range" data-queue="gap" min="0" max="60" value="${d.queue.gap}" aria-label="两张图之间的间隔秒数"></div>
         <div class="field"><div class="meter-label"><span>账号正忙（429）时重试</span><output>${d.queue.retries} 次</output></div><input class="slider" type="range" data-queue="retries" min="0" max="10" value="${d.queue.retries}" aria-label="429 重试次数"></div>
@@ -175,6 +185,10 @@ export function drawApp(ctx) {
       <div class="group">${toggle('strip', '发给模型时去掉旧出图块', d.strip, '出图块留在聊天记录里（图片靠它显示），但之后每次请求模型时会把它们去掉，省下上下文。')}</div>
       <div class="group pad"><p class="hint" style="padding:6px 0">出图块长这样（一张图一块）：${help('场景和每个人分开写：人数、镜头、光线放场景；表情、视线、动作放各自的角色行。插件把画风固定串接在场景前面，把角色 App 里的固定外貌补进对应的角色行，再交给选中的绘图引擎（GPT 会整理成英文描述，ComfyUI 会合成一条提示词）。新角色第一次出现时，模型写的「新外貌」会自动存进角色 App。图片会上传到酒馆，并存进相册。')}</p><pre class="code-preview">${esc(api.picTagFormat)}</pre></div>
       <p class="hint">每条回复固定出 ${(d.presets.find(p => p.id === d.activePreset) || d.presets[0]).count} 张图，在出图规则里改张数。</p><div class="actions">${btn('open-presets', icon('edit') + '编辑出图规则', 'secondary')}</div>`;
+    const serial = drawQueueChannel(e, d.comfy.url) === 'serial', waiting = serial && activeDraws > 0;
+    const generateLabel = submitting ? '正在提交……' : waiting ? '正在画……'
+      : (q.free === false ? icon('alert') : icon('paint')) + (!serial && (activeDraws || queue.length) ? `加入队列（${count} 张）` : count > 1 ? `画 ${count} 张` : '生成')
+        + (q.free === false ? (e === 'gpt' ? '（要花钱）' : '（会扣 Anlas）') : '');
     const sub = e === 'gpt' ? d.gpt.model : e === 'comfy' ? '' : subscription ? `${TIERS[subscription.tier] || '订阅'} · ${subscription.anlas} Anlas` : keyed ? '读取中' : '';
     // 正文出图 (how story replies get pictures) is set now and then: a chip by the title, not one more tab.
     v.draw(heading('绘图', (keyed && sub ? `<span class="chip">${esc(sub)}</span>` : '') + btn('tab', icon('image') + '正文出图', 'chip-button', `data-tab="chat" aria-pressed="${tab === 'chat'}"`), engineName(e))
@@ -182,13 +196,13 @@ export function drawApp(ctx) {
       + (keyed ? '' : `<div class="banner">${icon('key')}<span>${esc(api.drawMissing())}。</span>${btn('go-key', '去填写', 'chip-button')}</div>`)
       + queueCard()
       + `<div class="draw-meta">${btn('pick-style', (style().cover ? `<img class="chip-cover" src="${esc(style().cover.thumb)}" alt="" draggable="false">` : icon('layers')) + esc(style().name) + icon('down'), 'chip-button')}${costChip(q)}${e === 'nai' ? `<label class="chip-button file-button read-png" title="从 NovelAI 画的 PNG 读回提示词、角色和参数">${icon('import')}读图<input type="file" data-read-png accept="image/png,image/jpeg,image/webp" aria-label="从 NovelAI 的图读参数" hidden></label>` : ''}</div>
-        <div class="canvas-card"><div class="canvas-main${main ? '' : ' empty'}" style="aspect-ratio:${p.width}/${p.height}">${main ? `<button type="button" class="canvas-zoom" data-action="zoom" aria-label="放大查看"><img src="${esc(main)}" alt="生成的图片"></button><button type="button" class="canvas-heart" data-action="heart" aria-pressed="${hearts.has(shown?.photoId)}" aria-label="${hearts.has(shown?.photoId) ? '取消收藏' : '收藏'}">${icon('heart', hearts.has(shown?.photoId))}</button>` : `<span>${comfy && !(comfy.controls.includes('width') && comfy.controls.includes('height')) ? '尺寸由工作流决定' : `${p.width} × ${p.height}`}<br>还没有图</span>`}${busy ? `<span class="canvas-busy">${esc(engineName(e))} 正在画……</span>` : ''}</div>
-          ${results.length ? `<div class="canvas-side" data-keep-scroll="results">${thumbs.map((url, i) => `<button class="thumb" data-action="thumb" data-index="${i}" aria-pressed="${i === current}" aria-label="第 ${i + 1} 张"${hearts.has(results[i].photoId) ? ' data-fav' : ''}>${url ? `<img src="${esc(url)}" alt="">` : ''}</button>`).join('')}</div>` : ''}</div>
+        <div class="canvas-card"><div class="canvas-main${main ? '' : ' empty'}" style="aspect-ratio:${p.width}/${p.height}">${main ? `<button type="button" class="canvas-zoom" data-action="zoom" data-photo-id="${esc(shown.photoId)}" aria-label="放大查看"><img src="${esc(main)}" alt="生成的图片"></button><button type="button" class="canvas-heart" data-action="heart" data-photo-id="${esc(shown.photoId)}" aria-pressed="${hearts.has(shown?.photoId)}" aria-label="${hearts.has(shown?.photoId) ? '取消收藏' : '收藏'}">${icon('heart', hearts.has(shown?.photoId))}</button>` : `<span>${comfy && !(comfy.controls.includes('width') && comfy.controls.includes('height')) ? '尺寸由工作流决定' : `${p.width} × ${p.height}`}<br>还没有图</span>`}${activeDraws ? `<span class="canvas-busy">${esc(engineName(e))} 正在画……</span>` : ''}</div>
+          ${results.length ? `<div class="canvas-side" data-keep-scroll="results">${thumbs.map((url, i) => `<button class="thumb" data-action="thumb" data-photo-id="${esc(results[i].photoId)}" aria-pressed="${i === current}" aria-label="第 ${i + 1} 张"${hearts.has(results[i].photoId) ? ' data-fav' : ''}>${url ? `<img src="${esc(url)}" alt="">` : ''}</button>`).join('')}</div>` : ''}</div>
         ${shown ? `<p class="hint canvas-meta">${[shown.tool ? (shown.prompt || '') : shown.params.model, `${shown.params.width}×${shown.params.height}`, shown.params.steps ? shown.params.steps + ' 步' : '', shown.seed >= 0 ? '种子 ' + shown.seed : ''].filter(Boolean).map(esc).join(' · ')}</p>` : ''}
         ${shown && e === 'nai' && keyed ? toolsHTML() : ''}
         <div class="segmented draw-tabs">${tabs.map(([k, l]) => `<button data-action="tab" data-tab="${k}" aria-pressed="${k === tab}">${l}</button>`).join('')}</div>
         ${body}
-        <div class="savebar"><div class="draw-count" role="group" aria-label="一次画几张">${[1, 2, 3, 4].map(k => `<button type="button" data-action="count" data-count="${k}" aria-pressed="${k === count}" aria-label="一次画 ${k} 张">${k}</button>`).join('')}<small>张</small></div>${btn('generate', busy ? '正在画……' : (q.free === false ? icon('alert') : icon('paint')) + (count > 1 ? `画 ${count} 张` : '生成') + (q.free === false ? (e === 'gpt' ? '（要花钱）' : '（会扣 Anlas）') : ''), 'primary', busy || !keyed || comfy?.missing ? 'disabled' : '')}</div>`);
+        <div class="savebar"><div class="draw-count" role="group" aria-label="一次画几张">${[1, 2, 3, 4].map(k => `<button type="button" data-action="count" data-count="${k}" aria-pressed="${k === count}" aria-label="一次画 ${k} 张">${k}</button>`).join('')}<small>张</small></div>${btn('generate', generateLabel, 'primary', submitting || waiting || !keyed || comfy?.missing ? 'disabled' : '')}</div>`);
     // A new picture goes on top of the column: show it.
     if (newest) { newest = false; const side = v.root.querySelector('.canvas-side'); if (side) side.scrollTop = 0; }
     meters();
@@ -267,6 +281,9 @@ export function drawApp(ctx) {
     }
   }
 
+  function concurrencyField(key, value, billing) {
+    return `<div class="group pad"><label class="field"><span>生图并发数</span><span class="select"><select data-concurrency="${key}" aria-label="生图并发数">${[1, 2, 3, 4].map(n => `<option value="${n}"${n === value ? ' selected' : ''}>${n} 张</option>`).join('')}</select></span></label><p class="hint">底部选择一次要画的总张数。这里设置这个渠道最多同时画几张，多出的图片会排队。${billing}</p></div>`;
+  }
   /** GPT: quality, default 画幅 (正文出图 follows each block's own) and whether to ask before every paid picture. */
   function gptParams(g) {
     const seg = (action, value, list) => `<div class="segmented" style="margin:0">${list.map(([k, l]) => `<button data-action="${action}" data-value="${k}" aria-pressed="${value === k}">${l}</button>`).join('')}</div>`;
@@ -423,6 +440,7 @@ export function drawApp(ctx) {
   });
   v.on('change', '[data-param]', el => { api.saveDraw({params: {[el.dataset.param]: Number(el.value)}}); render(); });
   v.on('input', '[data-queue]', el => { el.previousElementSibling.querySelector('output').textContent = el.value + (el.dataset.queue === 'gap' ? ' 秒' : ' 次'); });
+  v.on('change', '[data-concurrency]', el => { api.saveDraw({queue: {[el.dataset.concurrency]: Number(el.value)}}); });
   v.on('change', '[data-queue]', el => { api.saveDraw({queue: {[el.dataset.queue]: Number(el.value)}}); });
   v.on('change', 'select[data-field]', el => { if (/^comfy-/.test(el.dataset.field)) return; api.saveDraw({params: {[el.dataset.field]: el.value}}); render(); });
   // ComfyUI fields: a select from 读取, or a typed name when nothing was read.
@@ -497,9 +515,9 @@ export function drawApp(ctx) {
       }
       case 'random-use': prompt = randomText; if (randomChars) characters = randomChars; randomText = ''; randomChars = null; render(); break;
       case 'random-clear': randomText = ''; randomChars = null; render(); break;
-      case 'thumb': current = index; render(); break;
+      case 'thumb': { const at = results.findIndex(r => r.photoId === el.dataset.photoId); if (at >= 0) { current = at; render(); } break; }
       case 'heart': {
-        const id = results[current]?.photoId;
+        const id = el.dataset.photoId;
         if (!id) break;
         const was = hearts.has(id);
         el.classList.remove('pop');
@@ -518,7 +536,7 @@ export function drawApp(ctx) {
         render();
         break;
       }
-      case 'cancel-all': if (await ctx.confirm('取消所有排队的图？', '正在画的那一张也会停下。')) api.cancelAllDraws(); break;
+      case 'cancel-all': if (await ctx.confirm('取消所有排队的图？', '等待的图片会移出队列，正在画的任务也会收到取消请求。')) api.cancelAllDraws(); break;
       case 'go-settings': ctx.open('settings'); break;
       case 'go-key': ctx.open('engines'); ctx.editEngine?.(eng()); break;
       case 'open-presets': ctx.open('presets'); ctx.showPresetKind?.('draw'); break;
@@ -529,9 +547,10 @@ export function drawApp(ctx) {
       // The big picture opens like the album: swipe to the ones drawn before and after (this visit's column), swipe up
       // for the prompt and parameters of each, to compare them.
       case 'zoom': {
-        if (!results.length) break;
+        const at = results.findIndex(r => r.photoId === el.dataset.photoId);
+        if (at < 0) break;
         const img = el.querySelector('img'), file = id => resultFile(results.find(r => r.photoId === id) || {photoId: id});
-        viewer = openAlbum({ctx, host: v.root.closest('.screen') || ctx.doc.body, ids: results.map(r => r.photoId), index: Math.max(0, current), from: img?.getBoundingClientRect() || null,
+        viewer = openAlbum({ctx, host: v.root.closest('.screen') || ctx.doc.body, ids: results.map(r => r.photoId), index: at, from: img?.getBoundingClientRect() || null,
           load: id => api.getPhoto(id),
           actions: [
             {key: 'fav', icon: 'heart', label: '收藏', labelOn: '已收藏', on: id => hearts.has(id), run: id => heart(id)},
@@ -619,36 +638,54 @@ export function drawApp(ctx) {
    * kept with the picture, for 变体 and 增强.
    */
   async function drawMany(request, n = 1, allowPaid = false) {
-    busy = true;
+    activeDraws++;
     render();
-    const fixed = Number.isInteger(request.params?.seed) && request.params.seed >= 0;
-    const {focus, source, comesBack, ...asked} = request;
-    const jobs = Array.from({length: n}, (_, i) => api.generateImage({...asked, preview: true, params: {...request.params, seed: fixed ? (request.params.seed + i) % 4294967295 : -1}, allowPaid,
-      label: request.label + (n > 1 ? ` · ${i + 1}/${n}` : '')}).then(async made => {
-      await keepPicture(comesBack ? {...made, params: {...made.params, ...comesBack}} : made, {focus, source, request});
-      if (n > 1 && i < n - 1) render();
-    }));
-    const failed = (await Promise.allSettled(jobs)).find(s => s.status === 'rejected' && !s.reason?.cancelled);
-    if (failed) ctx.notify(failed.reason.message);
-    if (allowPaid && eng() === 'nai') refreshSubscription(true);
-    busy = false;
-    render();
+    try {
+      const fixed = Number.isInteger(request.params?.seed) && request.params.seed >= 0;
+      const {focus, source, comesBack, ...asked} = request;
+      const jobs = Array.from({length: n}, async (_, i) => {
+        const made = await api.generateImage({...asked, preview: true, params: {...request.params, seed: fixed ? (request.params.seed + i) % 4294967295 : -1}, allowPaid,
+          label: request.label + (n > 1 ? ` · ${i + 1}/${n}` : '')});
+        await keepPicture(comesBack ? {...made, params: {...made.params, ...comesBack}} : made, {focus, source, request});
+        if (n > 1) render();
+      });
+      const failed = (await Promise.allSettled(jobs)).find(s => s.status === 'rejected' && !s.reason?.cancelled);
+      if (failed) ctx.notify(failed.reason.message);
+      if (allowPaid && eng() === 'nai') refreshSubscription(true);
+    } finally {
+      activeDraws--;
+      render();
+    }
   }
   const joinWords = list => list.map(x => (x || '').trim()).filter(Boolean).join(', ');
   async function generate() {
-    const s = style(), q = quote(), extra = eng() !== 'comfy' ? await refs.payload() : {base: null, refs: []};
-    const paid = await askPaid(q, count);
-    if (paid === false) return;
-    // 随机提示词 only exists for NovelAI; it is drawn in place of what is written.
-    const words = eng() === 'nai' && randomText || prompt, people = eng() === 'nai' && randomChars || characters;
-    await drawMany({
-      prompt: joinWords([s.artist, s.positive, words]),
-      negative: joinWords([s.negative, negative]),
-      characters: people.filter(c => c.prompt.trim()).map(({name, ...c}) => ({...c})),
-      params: eng() === 'nai' ? {...state().params, seed} : {seed}, name: engineName().replace(/\s+/g, ''), label: '绘图 App · ' + (words.trim().slice(0, 24) || s.name),
-      source: {prompt: words, negative, characters: structuredClone(people), params: {...state().params}, styleId: styleId()},
-      ...(extra.base ? {base: extra.base} : {}), ...(extra.refs.length ? {refs: extra.refs} : {}), ...(extra.focus ? {focus: extra.focus} : {})
-    }, count, paid === true);
+    const d = state(), e = d.engine, channel = drawQueueChannel(e, d.comfy.url);
+    if (submitting || (activeDraws && channel === 'serial')) return;
+    submitting = true;
+    render();
+    let batch;
+    try {
+      const n = count, s = style(), q = quote();
+      const words = e === 'nai' && randomText || prompt, people = structuredClone(e === 'nai' && randomChars || characters);
+      const request = {
+        prompt: joinWords([s.artist, s.positive, words]),
+        negative: joinWords([s.negative, negative]),
+        characters: people.filter(c => c.prompt.trim()).map(({name, ...c}) => ({...c})),
+        params: e === 'nai' ? {...d.params, seed} : {seed}, name: engineName(e).replace(/\s+/g, ''), label: '绘图 App · ' + (words.trim().slice(0, 24) || s.name),
+        source: {prompt: words, negative, characters: people, params: {...d.params}, styleId: styleId()},
+      };
+      const extra = e !== 'comfy' ? await refs.payload() : {};
+      const paid = await askPaid(q, n);
+      if (paid === false || v.disposed) return;
+      const now = state();
+      if (e !== now.engine || channel !== drawQueueChannel(now.engine, now.comfy.url)) throw Error('生图渠道已切换，请重新提交');
+      batch = drawMany({...request, ...(extra.base ? {base: extra.base} : {}), ...(extra.refs?.length ? {refs: extra.refs} : {}), ...(extra.focus ? {focus: extra.focus} : {})}, n, paid === true);
+    } finally {
+      // Confirmation and preparation cover one submission. Its pictures can keep drawing while the next is entered.
+      submitting = false;
+      render();
+    }
+    await batch;
   }
   /**
    * 参数网格: every cell one picture in the queue, with the settings of now and the cell's own on top. Without a seed on an
@@ -663,7 +700,7 @@ export function drawApp(ctx) {
     const quotes = asked.map(c => api.drawQuote(c.params, refs.extra())), paid = quotes.filter(q => q.free === false).length;
     if (paid && !await ctx.confirm(`这 ${asked.length} 张里有 ${paid} 张会扣 Anlas`, `按当前参数和订阅算的${subscription ? `（现有 ${subscription.anlas} Anlas）` : ''}，实际扣多少以 NovelAI 结算为准。排队时可以取消还没画的。`)) return;
     if (quotes.some(q => q.clamped)) ctx.notify('免费档守卫开着：超过 28 步或 1024×1024 的格子按守卫的范围画');
-    busy = true;
+    activeDraws++;
     render();
     const jobs = asked.map((c, i) => {
       const request = {prompt: joinWords([s.artist, s.positive, c.words]), negative: joinWords([s.negative, c.unwanted]), characters: people.filter(x => x.prompt.trim()).map(({name, ...x}) => ({...x}))};
@@ -686,7 +723,7 @@ export function drawApp(ctx) {
       } catch (error) { ctx.notify('拼网格图失败：' + error.message, {error: true}); }
     }
     refreshSubscription(true);
-    busy = false;
+    activeDraws--;
     render();
   }
   /** What a picture was drawn with, for 变体 and 增强: its own request, else what the app holds now (for a tool's picture). */
@@ -773,18 +810,18 @@ export function drawApp(ctx) {
     ['tool-settings', 'edit', '用它的设置', '提示词和参数', false], ['tool-seed', 'dice', '用它的种子', '接着微调', false], ['tool-cover', 'image', '当效果图', '放到它的画风上', false]];
   /** One line under the picture; opened, a grid of what can be done with it. */
   const toolsHTML = () => `<div class="pic-tools${toolsOpen ? ' open' : ''}"><button type="button" class="pic-tools-toggle" data-action="tools-toggle" aria-expanded="${toolsOpen}">${icon('wand')}<span><b>用这张图继续</b><small>${toolsOpen ? '收起' : '底图 · 参考 · Vibe · 变体 · 增强 · 放大 · 导演工具 · 设置'}</small></span>${icon('down')}</button>`
-    + (toolsOpen ? `<div class="pic-tools-grid" role="group" aria-label="用这张图">${PICTURE_TOOLS.map(([action, glyph, name, what, paid]) => `<button type="button" class="pic-tool" data-action="${action}"${paid && busy ? ' disabled' : ''}><span class="pic-tool-ico">${icon(glyph)}</span><b>${name}</b><small>${what}</small>${paid ? '<em>扣 Anlas</em>' : ''}</button>`).join('')}</div>` : '') + '</div>';
+    + (toolsOpen ? `<div class="pic-tools-grid" role="group" aria-label="用这张图">${PICTURE_TOOLS.map(([action, glyph, name, what, paid]) => `<button type="button" class="pic-tool" data-action="${action}"${paid && activeDraws ? ' disabled' : ''}><span class="pic-tool-ico">${icon(glyph)}</span><b>${name}</b><small>${what}</small>${paid ? '<em>扣 Anlas</em>' : ''}</button>`).join('')}</div>` : '') + '</div>';
   const shownBlob = async () => { const r = results[current]; const photo = r && await api.getPhoto(r.photoId); if (!photo?.blob) throw Error('这张图已经不在相册里了'); return photo.blob; };
   /** A tool's picture joins the column like a drawing. */
   async function runTool(input) {
-    busy = true; render();
+    activeDraws++; render();
     try {
       const {more = [], ...result} = await api.naiTool({...input, name: 'NovelAI'});
       // 去背景 answers with several versions: all of them join the column, to pick from.
       results.unshift(result, ...more); results = results.slice(0, MAX_RESULTS); current = 0; newest = true;
       refreshSubscription(true);
     } catch (error) { if (!error.cancelled) ctx.notify(error.message, {error: true}); }
-    busy = false; render();
+    activeDraws--; render();
   }
   async function tools(el) {
     try {
