@@ -56,8 +56,11 @@ export class DrawQueue {
   }
   list() {
     const positions = {serial: 0, gpt: 0, runninghub: 0};
-    return this.jobs.map(({key, label, channel, state, attempt, until, cloud}) =>
-      ({key, label, channel, state, attempt, until, position: positions[channel]++, cloud: cloud || null}));
+    const waiting = {serial: 0, gpt: 0, runninghub: 0};
+    return this.jobs.map(({key, label, channel, state, attempt, until, cloud, active}) => ({
+      key, label, channel, state, attempt, until, position: positions[channel]++,
+      waitingPosition: active ? null : ++waiting[channel], cloud: cloud || null,
+    }));
   }
   get(key) { return this.list().find(j => j.key === key) || null; }
   get pending() { return this.jobs.length > 0; }
@@ -98,6 +101,7 @@ export class DrawQueue {
       if (this.active[job.channel] >= limit) continue;
       job.active = true;
       this.active[job.channel]++;
+      this.changed();
       void this.execute(job);
     }
   }

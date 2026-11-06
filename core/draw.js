@@ -614,9 +614,15 @@ const VOID_TAGS = new Set(['br', 'hr', 'img', 'input', 'meta', 'link', 'source',
  */
 /** Blocks that hold something about the story, not the story: pictures never go in them, their lines are not offered. */
 const NOT_STORY = /^(?:bakemono|summary\w*|details|think\w*|reasoning|analysis|status\w*|statusbar|state\w*|memory|abstract|options?|choices?|branch\w*|table\w*|update\w*|var\w*|摘要|总结|状态\w*|选项|小剧场)$/i;
-export function blockRanges(source) {
+export function blockRanges(source, {singleLine = false, unclosed = false} = {}) {
   const text = String(source), ranges = [], stack = [];
-  for (const m of text.matchAll(/```[\s\S]*?(?:```|$)|<!--[\s\S]*?(?:-->|$)/g)) if (m[0].includes('\n')) ranges.push([m.index, m.index + m[0].length, m[0].startsWith('<') ? '!--' : '```']);
+  const fences = singleLine
+    ? /(`{3,}|~{3,})[\s\S]*?(?:\1|$)|(?<!`)``(?!`)[\s\S]*?``(?!`)|(?<!`)`(?!`)[\s\S]*?`(?!`)|<!--[\s\S]*?(?:-->|$)|<(pre|code)\b[^>]*>[\s\S]*?(?:<\/\2\s*>|$)/gi
+    : /```[\s\S]*?(?:```|$)|<!--[\s\S]*?(?:-->|$)/g;
+  for (const m of text.matchAll(fences)) if (singleLine || m[0].includes('\n')) {
+    const name = m[2]?.toLowerCase() || (m[0].startsWith('<') ? '!--' : m[0].startsWith('~') ? '~~~' : '```');
+    ranges.push([m.index, m.index + m[0].length, name]);
+  }
   const hidden = at => ranges.some(([a, b]) => at >= a && at < b);
   for (const m of text.matchAll(/<(\/?)([A-Za-z一-鿿][\w一-鿿:-]*)\b[^<>]*?(\/?)>/g)) {
     if (hidden(m.index)) continue;
@@ -626,10 +632,12 @@ export function blockRanges(source) {
     const at = stack.map(x => x.name).lastIndexOf(name);
     if (at < 0) continue;
     const open = stack[at];
+    if (unclosed) for (const orphan of stack.slice(at + 1)) ranges.push([orphan.start, text.length, orphan.name]);
     stack.length = at;
     const end = m.index + m[0].length;
-    if (text.slice(open.start, end).includes('\n')) ranges.push([open.start, end, name]);
+    if (singleLine || text.slice(open.start, end).includes('\n')) ranges.push([open.start, end, name]);
   }
+  if (unclosed) for (const open of stack) ranges.push([open.start, text.length, open.name]);
   return ranges;
 }
 /**
@@ -876,6 +884,8 @@ export function parseBlock(body) {
  */
 export function parsePictures(message) {
   message = String(message);
+  const hidden = blockRanges(message, {singleLine: true, unclosed: true})
+    .filter(([, , name]) => /^(?:think[\w:-]*|reasoning|analysis|pre|code|!--|```|~~~)$/i.test(name));
   const tags = [];
   for (const m of message.matchAll(PAIRED)) {
     if (/\bsrc\s*=/i.test(m[1])) continue;
@@ -889,11 +899,14 @@ export function parsePictures(message) {
     tags.push({start: m.index, end: m.index + m[0].length, prompt: attribute(m[1], 'prompt'), who: attribute(m[1], 'characters') || ''});
   }
   const found = [];
+  let originalIndex = 0;
   for (const tag of tags.sort((a, b) => a.start - b.start)) {
     if (!tag.prompt && !tag.spec?.cast.length) continue;
-    const characters = tag.who.split(/[,，、]/).map(x => x.trim()).filter(Boolean), index = found.length;
+    // Saved pictures use the old index, including tags that used to be parsed inside hidden text.
+    const characters = tag.who.split(/[,，、]/).map(x => x.trim()).filter(Boolean), index = originalIndex++;
     const hash = tag.spec ? hashText(index + '|' + tag.body) : hashText(index + '|' + tag.prompt + '|' + characters.join(','));
-    found.push({index, start: tag.start, end: tag.end, prompt: (tag.prompt || '').slice(0, 4000), characters, hash, spec: tag.spec || null, ...(tag.spec ? {body: tag.body} : {})});
+    if (hidden.some(([start, end]) => tag.start >= start && tag.start < end)) continue;
+    found.push({index: found.length, start: tag.start, end: tag.end, prompt: (tag.prompt || '').slice(0, 4000), characters, hash, spec: tag.spec || null, ...(tag.spec ? {body: tag.body} : {})});
   }
   return found;
 }

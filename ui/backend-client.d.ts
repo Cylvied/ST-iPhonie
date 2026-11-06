@@ -302,6 +302,8 @@ export interface DrawQueueSettings { gap: number; retries: number; gptConcurrenc
 export interface CloudQueueSettings { enabled: boolean; kind: 'room' | 'keyhash'; url: string; room: string; }
 /** One picture in the drawing queue. */
 export interface DrawJob { key: string; label: string; channel: 'serial' | 'gpt' | 'runninghub'; state: 'waiting' | 'spacing' | 'remote' | 'busy' | 'running'; attempt: number; until: number; position: number;
+    /** One-based place among jobs still waiting for a slot in this channel; null once admitted. */
+    waitingPosition: number | null;
     /** While waiting in the cloud queue: people ahead, who is drawing, and the shared cooldown in ms. */
     cloud: { position: number; holder: string; cooldown: number } | null; }
 /** unlimited: an active Opus subscription (free small images). usage: the V5 allowance, when NovelAI reports it. */

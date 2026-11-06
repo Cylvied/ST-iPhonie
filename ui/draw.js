@@ -60,16 +60,29 @@ export function drawApp(ctx) {
   const words = wordHelper({ctx, api, active: () => eng() === 'nai' && api.drawReady()});
   const grid = gridPanel({ctx, api, run: plan => drawGrid(plan), render: () => render()});
   let queue = api.drawQueue?.() || [], cloudError = api.cloudQueueError?.() || '', cloudNote = null;
-  const jobState = j => j.state === 'running' ? '正在画' : j.state === 'busy' ? `账号正忙，稍后重试（第 ${j.attempt} 次）` : j.state === 'spacing' ? '马上开始'
-    : j.state === 'remote' ? (j.cloud?.position > 0 ? `云端排队，前面 ${j.cloud.position} 位` : j.cloud?.cooldown > 5000 ? `大家一起等 ${Math.ceil(j.cloud.cooldown / 1000)} 秒` : '云端马上轮到') : `第 ${j.position + 1} 位`;
+  function jobState(job) {
+    if (job.waitingPosition > 0) return `候补第 ${job.waitingPosition} 张`;
+    if (job.state === 'running') return '正在画';
+    if (job.state === 'busy') return `账号正忙，稍后重试（第 ${job.attempt} 次）`;
+    if (job.state === 'spacing') return '等请求间隔';
+    if (job.state === 'remote') {
+      if (job.cloud?.position > 0) return `云端排队，前面 ${job.cloud.position} 位`;
+      if (job.cloud?.cooldown > 5000) return `云端冷却 ${Math.ceil(job.cloud.cooldown / 1000)} 秒`;
+      return '云端马上轮到';
+    }
+    return job.channel === 'serial' ? '等浏览器队列放行' : '正在启动';
+  }
   function queueCard() {
     const d = state(), showError = cloudError && d.engine === 'nai' && d.queue.cloud.enabled;
     if (!queue.length && !showError) return '';
+    const waiting = queue.filter(job => job.waitingPosition > 0).length;
+    const serialName = drawQueueChannel(d.engine, d.comfy.url) === 'serial' ? engineName(d.engine) : '本机队列';
+    const channelNames = {serial: serialName, gpt: 'GPT', runninghub: 'RunningHub'};
     const rows = queue.map(job => {
       const cancel = job.state !== 'running' || job.channel === 'gpt' || job.channel === 'runninghub';
-      return `<div class="setting-row"><span>${esc(job.label || '图片')}</span><small>${esc(jobState(job))}</small>${cancel ? btn('cancel-job', icon('close'), 'text-button', `data-key="${esc(job.key)}" aria-label="取消这张"`) : ''}</div>`;
+      return `<div class="setting-row"><span>${esc(job.label || '图片')}</span><small>${esc(channelNames[job.channel])} · ${esc(jobState(job))}</small>${cancel ? btn('cancel-job', icon('close'), 'text-button', `data-key="${esc(job.key)}" aria-label="取消这张"`) : ''}</div>`;
     });
-    return `<div class="group pad queue-card"><div class="row-heading"><strong style="flex:1">排队 · ${queue.length} 张</strong>${queue.length ? btn('cancel-all', '全部取消', 'text-button') : ''}</div>${showError ? `<p class="hint error-copy" style="padding:0 0 6px">${esc(cloudError)}，这次按本机排队</p>` : ''}${rows.join('')}</div>`;
+    return `<div class="group pad queue-card"><div class="row-heading"><strong style="flex:1">处理中 ${queue.length - waiting} 张 · 候补 ${waiting} 张</strong>${queue.length ? btn('cancel-all', '全部取消', 'text-button') : ''}</div>${showError ? `<p class="hint error-copy" style="padding:0 0 6px">${esc(cloudError)}，这次按本机排队</p>` : ''}${rows.join('')}</div>`;
   }
   const state = () => api.getState().draw;
   const eng = () => state().engine, engineName = (e = eng()) => api.drawCatalog.engineNames?.[e] || 'NovelAI';

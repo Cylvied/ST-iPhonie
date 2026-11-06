@@ -35,6 +35,41 @@ test('each provider starts two jobs, then starts the oldest waiting job when eit
   assert.equal(queue.pending, false);
 });
 
+test('waiting ranks count only same-channel jobs waiting for a slot and update on cancellation and promotion', async () => {
+  const queue = new DrawQueue();
+  const jobs = new Map();
+  for (const key of ['g1', 'r1', 'g2', 'r2', 'g3', 'r3', 'g4', 'r4', 'r5']) {
+    jobs.set(key, hold(queue, key[0] === 'g' ? 'gpt' : 'runninghub', key));
+  }
+  const ranks = () => Object.fromEntries(queue.list().map(j => [j.key, j.waitingPosition]));
+  assert.deepEqual(ranks(), {g1: null, r1: null, g2: null, r2: null, g3: 1, r3: 1, g4: 2, r4: 2, r5: 3});
+  assert.equal(queue.get('r3').position, 2);
+  queue.cancel('r3');
+  await assert.rejects(jobs.get('r3').job, error => error.cancelled);
+  assert.equal(queue.get('r4').waitingPosition, 1);
+  assert.equal(queue.get('r5').waitingPosition, 2);
+  jobs.get('r2').resolve(); await jobs.get('r2').job;
+  assert.equal(queue.get('r4').waitingPosition, null);
+  assert.equal(queue.get('r5').waitingPosition, 1);
+  assert.equal(queue.get('g4').waitingPosition, 2);
+  for (const h of jobs.values()) h.resolve();
+  await Promise.allSettled(Array.from(jobs.values(), h => h.job));
+});
+
+test('an admitted serial job waiting for a Web Lock has no local waiting rank', async () => {
+  const lock = deferred();
+  let last;
+  const queue = new DrawQueue({gap: () => 0, onChange: jobs => { last = jobs; },
+    locks: {request: async (_name, _options, run) => { await lock.promise; return run(); }}});
+  const first = hold(queue, 'serial', 'first');
+  assert.equal(last[0].state, 'waiting');
+  assert.equal(last[0].waitingPosition, null);
+  const second = hold(queue, 'serial', 'second');
+  assert.equal(queue.get('second').waitingPosition, 1);
+  lock.resolve(); first.resolve(); second.resolve();
+  await Promise.all([first.job, second.job]);
+});
+
 test('cancelling a running job retains its slot during cleanup, while cancelling a waiting job removes it immediately', async () => {
   const queue = new DrawQueue({concurrency: () => 1});
   const cleanup = deferred(), stopped = deferred();
@@ -52,6 +87,8 @@ test('cancelling a running job retains its slot during cleanup, while cancelling
   queue.cancel('active');
   await stopped.promise;
   assert.equal(queue.get('next').state, 'waiting');
+  assert.equal(queue.get('active').waitingPosition, null);
+  assert.equal(queue.get('next').waitingPosition, 1);
   assert.equal(queue.add({key: 'active', task: () => assert.fail('Duplicate key ran')}), run);
   assert.equal(queue.pending, true);
   cleanup.resolve(); await assert.rejects(run, isCancelled);

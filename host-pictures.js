@@ -165,7 +165,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     scheduleRender();
     try {
       const inputs = pictureInputs(settings(), tag, message.mes);
-      const result = await backend.generateImage({...inputs, allowPaid: permission === 'paid', name: 'chat', key, valid, label: '正文图片 · ' + tag.prompt.slice(0, 24)});
+      const result = await backend.generateImage({...inputs, allowPaid: permission === 'paid', name: 'chat', key, valid, label: `正文图片 · 第 ${tag.index + 1} 张 · ` + tag.prompt.slice(0, 24)});
       if (!valid()) return;
       jobs.set(key, {state: 'generating', saving: true});
       scheduleRender();
@@ -347,7 +347,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
   function queueText(key) {
     const job = backend.drawQueue?.get?.(key);
     if (!job) return '正在处理图片……';
-    const service = job.channel === 'runninghub' ? 'RunningHub' : DRAW_ENGINE_NAMES[settings().draw.engine];
+    const service = job.channel === 'runninghub' ? 'RunningHub' : job.channel === 'gpt' ? 'GPT 生图' : DRAW_ENGINE_NAMES[settings().draw.engine];
     if (job.state === 'running') return job.attempt ? `${service} 正在画……（第 ${job.attempt + 1} 次尝试）` : `${service} 正在画……`;
     if (job.state === 'busy') return `${service} 正忙，稍后自动重试（第 ${job.attempt} 次）`;
     if (job.state === 'spacing') return '排队中，马上开始';
@@ -356,7 +356,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
       if (c.position > 0) return `云端排队中，前面还有 ${c.position} 位${c.holder ? `（${c.holder} 正在画）` : ''}`;
       return c.cooldown > 5000 ? `账号刚才忙，大家一起等 ${Math.ceil(c.cooldown / 1000)} 秒` : '云端排队，马上轮到你';
     }
-    return `排队中（队列第 ${job.position + 1} 张）`;
+    return job.waitingPosition > 0 ? `${service} · 候补第 ${job.waitingPosition} 张` : `${service} · 等浏览器队列放行`;
   }
 
   function frame(inner) { return `<span class="sttts-pic-frame">${inner}</span>`; }
@@ -364,7 +364,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     const record = stored(message, tag.hash), pic = shown(message, tag.hash), key = jobKey(id, tag), job = jobs.get(key);
     const s = settings(), folded = folds.get(id + ':' + tag.hash) ?? s.draw.fold;
     const state = job?.state || (pic ? 'done' : record?.removed ? 'removed' : 'idle');
-    const waiting = job?.saving ? '正在保存图片……' : state === 'generating' ? queueText(key) : '';
+    const waiting = state === 'generating' ? `本楼第 ${tag.index + 1} 张 · ${job?.saving ? '正在保存图片……' : queueText(key)}` : '';
     const signature = [state, pic?.url, pic?.count, folded, waiting, job?.message].join('|');
     if (el.dataset.stttsRendered === signature) return;
     el.dataset.stttsRendered = signature;
